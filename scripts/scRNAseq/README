@@ -1,0 +1,1 @@
+Scripts are to perform scRNA-seq analyses are provided here. The output from each part is used as input into the next (e.g., must run PART1 prior to running PART2, etc.). If you have any questions, please contact Nicholas Mikolajewiz (n.mikolajewicz@utoronto.ca).
