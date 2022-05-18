@@ -1,0 +1,544 @@
+---
+title: "barcoding_analysis"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+editor_options: 
+  chunk_output_type: inline
+---
+
+
+
+```{r setup, include=FALSE}
+
+# clear global enviroment
+rm(list = ls())
+
+# initiate timer
+start.time <- proc.time()
+
+# List of packages to load
+packages2load <- c("Seurat", "GSVA", 
+                   "plyr", "dplyr", "tidyr", "reshape2", "preprocessCore", "stringr", "RColorBrewer", "ggplot2", "gridExtra", 
+                   "DT", "flexdashboard", "ggpmisc", "ggExtra", "grid", "ggrepel", "future", "scMiko", "survival", "survminer", "topGO",
+                   "AnnotationDbi", "org.Mm.eg.db", "org.Hs.eg.db", "ddpcr", "tm", "homologene", "plotly", "parallel", "doParallel", "foreach", "quantreg")
+
+# load packages
+invisible(lapply(packages2load, library, character.only = TRUE, quietly = T))
+
+
+```
+
+
+```{r input parameters, warning=FALSE}
+
+# Specify data directories
+# dir.root <- "D:/Users/Nick/Dropbox/PDF Projects - JM/Data/scRNA-seq/01_sci-RNA-seq3_Hong_Kevin_Jason/NM_HH/Data/"
+dir.root <- "C:/Users/Owner/Dropbox/PDF Projects - JM/Data/scRNA-seq/01_sci-RNA-seq3_Hong_Kevin_Jason/NM_HH/Data/"
+dir.preprocessed <- "Preprocessed_Datasets/"
+dir.bulkfile <- "Results/GBM (UHN)/"
+
+
+# SINGLE CELL PARAMETERS
+input.sc.file <- "Module1_M16_M27_UHN_240620.Rdata"
+cluster.resolution <- 1
+subsample_factor <-1 
+
+# BULK PARAMETERS
+input.bulk.file <- "barcoding_bulkRNA_NM_200720.xlsx"
+
+# Specify whether figures are printed inline
+print.inline <- T
+
+# subgroup data
+subset.df <- data.frame(
+  field = "Barcode",
+  subgroups = c("ctrl.0231", "ctrl.0238", "TR.0231", "TR.0238") #  "TRA.0231",
+)
+
+# specify samples of interest
+which.samples <- c("BT428_MRD", "BT954_MRD_CON", "BT935_MRD_CT", "MBT06_MRD_CON", "BT799_MRD_CT")
+which.samples2 <- c("BT428_MRD", "BT954_MRD_CON", "BT935_MRD_CT", "MBT06_MRD_CON", "BT799_MRD_CT", 
+                    "BT799_MRD_T_R", "BT935_MRD_T_R", "BT954_MRD_T_R", "MBT06_MRD_T_R")
+
+
+# specify color palettes
+c0231.col <-brewer.pal(10, "GnBu")[3]
+t0231.col <-brewer.pal(10, "GnBu")[5]
+c0238.col <-brewer.pal(10, "GnBu")[6]
+t0238.col <-brewer.pal(10, "GnBu")[9]
+
+BT799.color <-brewer.pal(10, "GnBu")[7]
+MBT06.color <- brewer.pal(10, "GnBu")[3]
+
+```
+
+```{r GENERAL - load single cell data}
+
+# load query dataset
+load(paste0(dir.root, dir.preprocessed, input.sc.file));
+so.query <- prepSeurat(so); rm(so)
+current.assay <- DefaultAssay(so.query)
+
+# cluster data
+so.query <- setResolution(so.query, cluster.resolution)
+
+# subsample 
+stopifnot(exists("subsample_factor"))
+if (subsample_factor < 1){
+  so.query <- downsampleSeurat(so.query, subsample.factor = subsample_factor)
+}
+
+# subset data
+if (exists("subset.df")){
+  so.query <- subsetSeurat(so.query, subset.df)
+}
+
+
+```
+
+
+```{r save expression matrices}
+
+so.query@meta.data$cell.line <- NA
+so.query@meta.data$cell.line[grepl("0231", so.query@meta.data$Barcode)] <- "MBT06"
+so.query@meta.data$cell.line[grepl("0238", so.query@meta.data$Barcode)] <- "BT799"
+cluster.UMAP(so.query, "cell.line")
+
+count.matrix <- so.query@assays[["RNA"]]@counts
+normalized.matrix <- so.query@assays[["SCT"]]@data
+scaled.matrix <- so.query@assays[["SCT"]]@scale.data
+
+df.meta <- so.query@meta.data
+df.meta$umap.x <- so.query@reductions[["umap"]]@cell.embeddings[ ,1]
+df.meta$umap.y <- so.query@reductions[["umap"]]@cell.embeddings[ ,2]
+
+colnames(df.meta)
+
+df.meta <- df.meta[ ,c("nCount_RNA","nFeature_RNA","nCount_SCT", "nFeature_SCT" , "Barcode", "percent.mt", "S.Score", "G2M.Score", "Phase",  "cell.line","umap.x" ,"umap.y" )]
+df.meta$cell.id <- rownames(df.meta)
+
+
+MBT06.control.mat <- so.query@assays[["RNA"]]@counts[ , grepl("ctrl.", df.meta$Barcode) & df.meta$cell.line == "MBT06"]
+MBT06.tr.mat <- so.query@assays[["RNA"]]@counts[ , grepl("TR.", df.meta$Barcode) & df.meta$cell.line == "MBT06"]
+BT799.control.mat <- so.query@assays[["RNA"]]@counts[ , grepl("ctrl.", df.meta$Barcode) & df.meta$cell.line == "BT799"]
+BT799.tr.mat <- so.query@assays[["RNA"]]@counts[ , grepl("TR.", df.meta$Barcode) & df.meta$cell.line == "BT799"]
+
+# write.csv(x = MBT06.control.mat, file = "MBT06_Control_count_matrix.csv")
+# write.csv(x = MBT06.tr.mat, file = "MBT06_TR_count_matrix.csv")
+# write.csv(x = BT799.control.mat, file = "BT799_Control_count_matrix.csv")
+# write.csv(x = BT799.tr.mat, file = "BT799_TR_count_matrix.csv")
+# write.csv(x = count.matrix, file = "count_matrix.csv")
+# write.csv(x = normalized.matrix, file = "normalized_matrix.csv")
+# write.csv(x = scaled.matrix, file = "scaled_matrix.csv")
+# write.csv(x = df.meta, file = "meta_data.csv")
+
+```
+
+
+```{r evaluate stringent filter data intead of lenient filter, fig.width=16, fig.height=5}
+
+
+
+
+
+use.stringent <- F
+
+if (use.stringent){
+  
+  load(paste0(dir.root, dir.preprocessed, "R488_M01_NM2_GBM_UHN_stringent_240521.Rdata"));
+  so.query.str <- prepSeurat(so); rm(so)
+  
+  all.gene.str <- rownames(so.query.str@assays[["RNA"]])
+  
+  df.meta.len <- so.query@meta.data
+  df.meta.str <- so.query.str@meta.data
+  
+  
+  u.bc <- df.meta.len$Barcode
+  
+  for (i in 1:length(u.bc)){
+    
+    bc.name <- u.bc[i]
+    bc.cells <- rownames(df.meta.len)[df.meta.len$Barcode %in% bc.name]
+    
+    df.meta.str$Barcode[rownames(df.meta.str) %in% bc.cells] <- bc.name
+    
+  }
+  
+  so.query.str@meta.data <- df.meta.str
+  
+  so.query.str <- so.query.str[ ,so.query.str$Barcode != "unspecified"]
+  
+  
+  
+  df.umap.len <- getUMAP(so.query)[["df.umap"]]
+  
+  df.umap.len$Passes_Stringent_Filter <- df.umap.len$var %in% colnames(so.query.str)
+  
+  plt.str.highlight <- df.umap.len %>%
+    ggplot(aes(x = x, y = y, color = Passes_Stringent_Filter)) + 
+    geom_point() + 
+    scale_color_manual(values = c("TRUE" = "tomato", "FALSE" = "grey")) + 
+    theme_miko(legend = T) + 
+    labs(caption = "Filter: i) >3000 genes count (n/cell), ii) <10% mitochondrial content (%/cell)", 
+         x = "UMAP 1", y = "UMAP 2", title = "Cell retention following stringent QC filter", subtitle = "UMAP")
+  
+  plt.str.highlight
+  
+  so.orig <- so.query
+  so.query <- so.query.str
+  
+  cluster.UMAP(so.query, "Barcode")
+  
+  
+ plt.lenient_Vs_stringent_umap <-  cowplot::plot_grid(cluster.UMAP(so.orig, "Barcode") + 
+                       labs(title = "Original UMAP", subtitle = "Lenient filter thresholds") + theme_miko(center.title = T),
+                     cluster.UMAP(so.query, "Barcode") + 
+                       labs(title = "Updated UMAP", subtitle = "Stringent filter thresholds") + theme_miko(center.title = T), 
+                     plt.str.highlight + labs(subtitle=   ""), labels = "AUTO", nrow = 1, rel_widths = c(1,1,1.4))
+    
+}
+
+
+# savePDF("stringent_vs_lenient_UMAP.pdf", plt.lenient_Vs_stringent_umap, fig.width=16, fig.height=5)
+# df.cell.bc <- read.csv("cell_barcodes.csv", header = T)
+# so.query$is.mm <- colnames(so.query) %in% df.cell.bc$AAACCTGCAAGTCATC.1[df.cell.bc$hg19 == "mm10"]
+# cluster.UMAP(so.query, "is.mm")
+
+
+```
+
+```{r generate scRNAseq UMAP}
+
+# color palette
+col.ctrl <- rgb(197, 232, 201, maxColorValue = 255)
+col.TR <- rgb(51, 158, 202, maxColorValue = 255)
+col.TRA <- rgb(102, 89, 202, maxColorValue = 255)
+
+# MBT06 ########################################################################
+which.cells <- grepl("0231", so.query@meta.data[["Barcode"]])
+so.0231 <- subset(so.query, cells = colnames(so.query)[which.cells])
+
+df.umap <- data.frame(so.0231@reductions[["umap"]]@cell.embeddings)
+df.umap$cluster <- so.0231@meta.data[["seurat_clusters"]]
+df.umap$Barcode <- so.0231@meta.data[["Barcode"]]
+colnames(df.umap) <- c("x","y", "cluster", "Barcode")
+
+# set colors
+df.umap$color <- NA
+df.umap$color[grepl("ctrl", df.umap$Barcode)] <- col.ctrl
+df.umap$color[grepl("TR", df.umap$Barcode)] <- col.TR
+df.umap$color[grepl("TRA", df.umap$Barcode)] <- col.TRA
+colors.mbt07 <- c("ctrl.0231" = col.ctrl, "TR.0231" = col.TR, "TRA.0231" = col.TRA)
+
+gsea.cluster.plot <-  ggplot() +   
+  geom_point(data = df.umap, 
+             aes(x, y, fill = Barcode, color = Barcode),
+             size = 1) + 
+  theme_miko(legend = T) + 
+  coord_cartesian(xlim = c(0, 10)) +
+  xlab("UMAP 1") + ylab("UMAP 2") +
+  labs(title = "MBT06", color= "Sample") +
+  scale_color_manual(values = colors.mbt07) + guides(fill = F, color = guide_legend(override.aes = list(size = 5))) 
+
+print(gsea.cluster.plot)
+
+# BT799 ########################################################################
+which.cells <- grepl("0238", so.query@meta.data[["Barcode"]])
+so.0238 <- subset(so.query, cells = colnames(so.query)[which.cells])
+
+df.umap <- data.frame(so.0238@reductions[["umap"]]@cell.embeddings)
+df.umap$cluster <- so.0238@meta.data[["seurat_clusters"]]
+df.umap$Barcode <- so.0238@meta.data[["Barcode"]]
+colnames(df.umap) <- c("x","y", "cluster", "Barcode")
+
+# set colors
+df.umap$color <- NA
+df.umap$color[grepl("ctrl", df.umap$Barcode)] <- col.ctrl
+df.umap$color[grepl("TR", df.umap$Barcode)] <- col.TR
+colors.mbt07 <- c("ctrl.0238" = col.ctrl, "TR.0238" = col.TR)
+
+gsea.cluster.plot <-  ggplot() +   
+  geom_point(data = df.umap, 
+             aes(x, y, fill = Barcode, color = Barcode),
+             size = 1) + 
+  theme_miko(legend = T) + 
+  coord_cartesian(xlim = c(-10, -3)) +
+  xlab("UMAP 1") + ylab("UMAP 2") +
+  labs(title = "BT799", color= "Sample") +
+  scale_color_manual(values = colors.mbt07) + guides(fill = F, color = guide_legend(override.aes = list(size = 5))) 
+
+print(gsea.cluster.plot)
+
+ # colour = "name1",
+
+```
+
+
+```{r GENERAL - load bulkRNAseq data}
+
+# file path
+bulk.file <- paste0(dir.root, dir.bulkfile, input.bulk.file)
+
+# file sheets
+input.sheets <- readxl::excel_sheets(bulk.file)
+
+# import data
+bulk.list <- lapply(input.sheets, readxl::read_xlsx, path = bulk.file)
+
+# collapse data
+df.bulk <- purrr::map_dfc(bulk.list, function(x) x)
+df.genes <- df.bulk[ ,(grepl("Gene.symbol", colnames(df.bulk)))]
+df.bulk <- df.bulk[ ,!(grepl("Gene.symbol", colnames(df.bulk)))]
+df.bulk$genes <- as.vector(unlist(df.genes[ ,1]))
+
+```
+```{r GENERAL - helper function for labeling}
+
+# get condition from label
+conditionLabels <- function(df){
+  df$condition <- NA
+  df$condition[grepl("EN", df$sample)] <- "EN"
+  df$condition[grepl("CC", df$sample)] <- "CC"
+  df$condition[grepl("REC_CON", df$sample)] <- "REC_CON"
+  df$condition[grepl("MRD_CT|MRD_CON", df$sample)] <- "MRD_CT"
+  df$condition[grepl("REC_T_R", df$sample)] <- "REC_T_R"
+  df$condition[grepl("MRD_T_R", df$sample)] <- "MRD_T_R"
+  df$condition[grepl("PTS", df$sample)] <- "PTS" 
+  
+  return(df)
+}
+
+
+```
+
+
+```{r GENERAL - get single cell expression matrix}
+
+# get corrected matrix
+sct.mat <- getExpressionMatrix(so.query, which.data = "data")
+
+# get count matrix
+c.mat.meta <- so.query@assays[["RNA"]]@meta.features
+c.mat <- as.matrix(so.query@assays[["RNA"]]@counts)
+
+u.clusters <- getOrderedGroups(so.query, which.group = "Barcode", is.number = F)
+
+e.mat <- matrix(nrow = nrow(c.mat), ncol = length(u.clusters))
+cluster.membership <- so.query@meta.data[["Barcode"]]
+for (i in 1:length(u.clusters)){
+  e.mat[,i] <- apply(c.mat[ ,cluster.membership %in% u.clusters[i]], 1, function(x) sum(x, na.rm = T))
+}
+
+rownames(e.mat) <- rownames(c.mat)
+colnames(e.mat) <- u.clusters
+
+```
+
+```{r GENERAL - prep datasets}
+
+# remove duplicates
+df.bulk <- df.bulk[!(duplicated(df.bulk$genes)), ]
+e.mat <- e.mat[!(duplicated(rownames(e.mat))), ]
+c.mat <- c.mat[!(duplicated(rownames(c.mat))), ]
+sct.mat  <- sct.mat[!(duplicated(rownames(sct.mat))), ]
+
+# common gene list
+df.bulk <- df.bulk[df.bulk$genes %in% rownames(e.mat), ]
+e.mat <- e.mat[rownames(e.mat) %in% df.bulk$genes, ]
+c.mat <- c.mat[rownames(c.mat) %in% rownames(e.mat), ]
+sct.mat  <- sct.mat[rownames(sct.mat) %in% rownames(e.mat), ]
+
+do.log <- T
+do.scale <- T
+
+# log and scale responses
+which.col <- !(colnames(df.bulk) %in% "genes")
+df.bulk[,which.col] <- apply(df.bulk[,which.col] , 2, function(x) {
+  
+  if (do.log){
+    x.log <- log1p(x)
+  } else {
+    x.log <- x
+  }
+  
+  if (do.scale){
+    x.log <- (x.log - mean(x.log, na.rm = T)) / sd(x.log, na.rm= T)
+  } else {
+    x.log
+  }
+  
+  return(x.log)
+})
+
+e.mat <- apply(e.mat , 2, function(x) {
+  
+  if (do.log){
+    x.log <- log1p(x)
+  } else {
+    x.log <- x
+  }
+  
+  if (do.scale){
+    x.log <- (x.log - mean(x.log, na.rm = T)) / sd(x.log, na.rm= T)
+  } else {
+    x.log
+  }
+  
+  return(x.log)
+})
+
+# df.sc <- e.mat[ , c("genes", "ctrl.0231", "ctrl.0238")]
+df.sc <- data.frame(gene = rownames(e.mat), 
+                    ctrl.0231 = e.mat [ ,"ctrl.0231"], ctrl.0238 = e.mat [ ,"ctrl.0238"], 
+                    TR.0231 = e.mat [ ,"TR.0231"], TR.0238 = e.mat [ ,"TR.0238"])
+colnames(df.sc) <- c("gene", "sc.MBT06.ctrl", "sc.BT799.ctrl", "sc.MBT06.tr", "sc.BT799.tr")
+df.bk <- df.bulk[ ,c("genes", "MBT06_MRD_CON", "BT799_MRD_CT", "MBT06_MRD_T_R", "BT799_MRD_T_R")]
+colnames(df.bk) <- c("gene", "bk.MBT06.ctrl", "bk.BT799.ctrl", "bk.MBT06.tr", "bk.BT799.tr")
+df.merge <- merge(df.sc, df.bk, by = "gene")
+
+```
+
+
+
+
+```{r FUNCTION identify markers of interest}
+
+# helper function to run differential expression analysis on groups of interest
+get.markers <- function(so.query, group.1.name, group.2.name){
+  group.1 <- colnames(so.query)[which(so.query@meta.data[["Barcode"]] %in% group.1.name)] # MBT06
+  group.2 <- colnames(so.query)[which(so.query@meta.data[["Barcode"]] %in% group.2.name)] # BT799
+  
+  
+  so.subset <- subset(so.query, cells = c(group.1, group.2))
+  
+  # set identity
+  Idents(so.subset) <- "Barcode"
+  
+  # find markers
+    so.markers <- Seurat::FindAllMarkers(object = so.subset,
+                            test.use = "MAST",
+                            logfc.threshold = 0,
+                            min.pct = 0
+                            )
+    
+  so.markers$pct.dif <- so.markers$pct.1 - so.markers$pct.2
+  so.markers$pct.min <- pmin(so.markers$pct.1, so.markers$pct.2)
+  so.markers$pct.ratio1 <- so.markers$pct.1 / so.markers$pct.2
+  so.markers$pct.ratio2 <- so.markers$pct.2 / so.markers$pct.1
+  so.markers$pct.ratio.max <- pmax(so.markers$pct.ratio1, so.markers$pct.ratio2)
+  so.markers$genes <- rownames(so.markers)
+  
+  sig.thresholds <- c(
+    min.dif = 0.3, 
+    min.ratio = 3,
+    min.lfc =0.7) # min |dif|, min ratio
+  
+  # get specific markers
+  so.markers.spec <- so.markers[abs(so.markers$pct.dif) > sig.thresholds[1] & 
+                                  (so.markers$pct.ratio.max) > sig.thresholds[2] & 
+                                  abs(so.markers$avg_log2FC) > sig.thresholds[3], ]
+  
+  so.markers.spec$delta.sign <- sign(so.markers.spec$avg_log2FC)
+  
+  so.sig <- data.frame(genes = so.markers.spec$genes, direction = so.markers.spec$delta.sign)
+  
+  return(list(
+    res1 = so.markers.spec,
+    res2 = so.sig,
+    res3 = so.markers 
+  ))
+}
+
+
+```
+
+```{r deg to demonstrate stength of TR response}
+
+# so.021
+df.0231 <- presto::wilcoxauc(X = so.0231, group_by = "Barcode")
+df.0231 <- df.0231 %>% dplyr::filter(auc > 0.5, padj < 0.01)
+
+df.0238 <- presto::wilcoxauc(X = so.0238, group_by = "Barcode")
+df.0238 <- df.0238 %>% dplyr::filter(auc > 0.5, padj < 0.01)
+
+
+df.deg.tally <- data.frame(
+  x = c("MBT06", "BT799"),
+  n.deg = c(nrow(df.0231), nrow = nrow(df.0238))
+)
+
+df.deg.tally %>%
+  ggplot(aes(x = x, y= n.deg)) + 
+  geom_bar(stat = "identity") + 
+  labs(x = "Sample", y = "Number of differentially-expressed genes (Ctrl vs. TR)") + 
+  theme_miko() + 
+  labs(title = "Number of DEGs", subtitle = "Ctrl vs. TR")
+
+
+all.gene <- unique(c(as.character(df.0231$feature), as.character(df.0238$feature)))
+df.member <- data.frame(BT799 = all.gene %in% df.0231$feature, MBT06 = all.gene %in% df.0238$feature)
+
+plt.euler <- seqsetvis::ssvFeatureEuler(object = df.member, circle_colors =  c(MBT06.color, BT799.color)) + 
+  labs(subtitle = paste0("CON vs TR: ", nrow(df.0231), " (MBT06), ", nrow(df.0238), 
+                         " (BT799)\n", length(intersect(df.0231$feature,df.0238$feature)), " overlap"),
+       title = "Number of DEGs") + 
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme(plot.subtitle = element_text(hjust = 0.5))
+
+# savePDF("DEG_venn_diagram_010721.pdf", plt.euler)
+
+```
+
+
+```{r perform DEG analysis on single cell data using FindAllMarkers}
+
+# Comparison: MBT06 vs BT799 controls 
+group.1.name <- "ctrl.0231"
+group.2.name <- "ctrl.0238"
+markers.ctrl.comp <- get.markers(so.query, group.1.name, group.2.name)
+so.markers.spec <- markers.ctrl.comp$res1
+so.sig <- markers.ctrl.comp$res2
+so.markers.all <- markers.ctrl.comp$res3
+so.all <- so.markers.all[ ,c("genes", "avg_log2FC", "p_val_adj", "pct.dif", "pct.1" , "pct.2")]
+colnames(so.all) <- c("genes", "lfc", "p", "pd", "pct.1", "pct.2")
+
+```
+
+```{r Run gsea on differentially-expressed markers, fig.width=12, fig.height=6}
+
+df.ctrl.comp <- markers.ctrl.comp[["res3"]] %>% dplyr::filter(cluster == "ctrl.0231")
+df.ctrl.gsea <- runGSEA(gene = df.ctrl.comp$gene, value = df.ctrl.comp$avg_log2FC, species = "Hs", do.plot = F, db = "Bader")
+df.ctrl.gsea.sig <-  df.ctrl.gsea[df.ctrl.gsea$padj < 0.2, ]
+
+
+df.ctrl.gsea.sig.top <- bind_rows(
+  df.ctrl.gsea.sig %>% dplyr::top_n(10, NES), 
+  df.ctrl.gsea.sig %>% dplyr::top_n(10, -NES)
+)
+
+df.ctrl.gsea.sig.top %>% 
+  dplyr::arrange(NES) %>%
+  ggplot(aes(x = NES, y = reorder(pathway, NES))) + 
+  geom_bar(stat = "identity") + theme_miko() + 
+  labs(x = "NES (MBT06 - BT799)", y = "Pathway") + 
+  labs(title = "Differential Pathway Analysis", subtitle = c("MBT06 vs. BT799 (control non-treated samples)"))
+  
+
+```
+
+
+
+
+
+
+
+
+
+
+```{r}
+
+```
+
