@@ -1,1 +1,0 @@
-These scripts were used to perform the scRNAseq analyses presented in Qazi et al. The outputs of each script are used as inputs into the following script (i.e., to run PART2, you must first run PART1, etc). For question please contact Nicholas Mikolajewicz (n.mikolajewicz@utoronto.ca) 
