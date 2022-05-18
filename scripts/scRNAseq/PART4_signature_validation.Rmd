@@ -1,0 +1,3389 @@
+---
+title: "barcoding_analysis"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+editor_options: 
+  chunk_output_type: inline
+---
+
+
+
+```{r setup, include=FALSE}
+
+# clear global enviroment
+rm(list = ls())
+
+# initiate timer
+start.time <- proc.time()
+
+# List of packages to load
+packages2load <- c("Seurat", "GSVA", 
+                   "plyr", "dplyr", "tidyr", "reshape2", "preprocessCore", "stringr", "RColorBrewer", "ggplot2", "gridExtra", 
+                   "DT", "flexdashboard", "ggpmisc", "ggExtra", "grid", "ggrepel", "future", "scMiko", "survival", "survminer", "topGO",
+                   "AnnotationDbi", "org.Mm.eg.db", "org.Hs.eg.db", "ddpcr", "tm", "homologene", "plotly", "parallel", "doParallel", "foreach", "quantreg")
+ 
+# load packages
+invisible(lapply(packages2load, library, character.only = TRUE, quietly = T))
+
+
+```
+
+```{r README}
+
+# LOAD R ENVIROMENT FROM PART 3 PRIOR TO RUNNING THIS SCRIPT
+
+```
+
+
+```{r TCGA survival analysis, fig.width=12, fig.height=5}
+
+# prep data for survival analysis ##############################################
+
+df.tcga.gsva <- data.frame(sample = colnames(gbm.mat))
+df.tcga.gsva$line <- stringr::str_extract(df.tcga.gsva$sample, "[A-Za-z0-9]*")
+df.tcga.gsva <- bind_cols(df.tcga.gsva, gbm.meta.sub)
+
+df.surv <- df.tcga.gsva
+df.surv$status <- NA
+df.surv$status[df.surv$alive == "Alive"] <- FALSE
+df.surv$status[df.surv$alive == "Dead"] <- TRUE
+
+df.surv$time <- df.surv$dtf
+df.surv$time[!is.na(df.surv$dtd)] <-df.surv$dtd[!is.na(df.surv$dtd)]
+
+df.sig.surv <- NULL
+df.sig.surv.uni <- NULL
+surv.obj <- Surv(df.surv$time, df.surv$status)
+
+
+```
+
+```{r uni var anaysis all tcga genes and enrich }
+# [rownames(gbm.mat) %in% rownames(so.query), ]
+  all.var <- t(gbm.mat)
+sample.id <- rownames(all.var)
+df.all.var  <- data.frame(all.var)
+df.all.var$sample <- sample.id
+df.surv.all.var <- df.surv[ ,c("time", "status", "sample", "t.subtype", "age", "idh.subtype", "mgmt.promoter")]
+df.all.var <- merge(df.all.var,df.surv.all.var, by = "sample" )
+
+do.cox <- F
+
+if (do.cox){
+
+
+all.tcga.gene <- ag.set
+
+# all.tcga.gene %in% colnames(df.all.var)
+
+df.sig.surv.tcga <- NULL
+for (i in 1:length(all.tcga.gene)){
+  # try({
+    df.tcga.cur <- df.all.var[ ,c("time", "status",  gsub("-", ".", all.tcga.gene[i])  , "t.subtype", "age", "idh.subtype", "mgmt.promoter")]
+    colnames(df.tcga.cur) <- c("time", "status", "goi", "t.subtype", "age", "idh.subtype", "mgmt.promoter")
+    df.tcga.cur <- df.tcga.cur[complete.cases(df.tcga.cur), ]
+    # tcga.coxph <- coxph(Surv(time, status) ~ goi + age + idh.subtype + mgmt.promoter + t.subtype, data = df.tcga.cur)
+    tcga.coxph <- coxph(Surv(time, status) ~ goi + t.subtype , data = df.tcga.cur)
+    df.sig.surv.tcga <- bind_rows(df.sig.surv.tcga,
+                                  data.frame(
+                                    gene = all.tcga.gene[i],
+                                    coef.val1 =  summary(tcga.coxph)[["coefficients"]][1,1],
+                                    pval = summary(tcga.coxph)[["coefficients"]][1,5],
+                                    coef.val2 = tcga.coxph[["coefficients"]][["goi"]]))
+}
+    
+}
+
+```
+
+
+```{r bulk scoring of final geneset, fig.height = 10, fig.width = 5}
+
+# bulk scoring modular pathways
+df.bk.gsva.modpath <- bulkScoring(df.bulk, gene.set = list(
+  set1 =ag.set,
+  set2 = ti.set
+))
+
+plt.bulk.gsva.list <- plotBulkScores(df.bk.gsva.modpath , label.1 = "Ag", label.2 = "Ti", 
+                                        subtitle.label = "MRD Controls", which.barcodes = which.samples2)
+
+
+
+
+plt.bulk.gsva.modpath <- cowplot::plot_grid(plotlist = plt.bulk.gsva.list, ncol = 1, rel_heights = c(2, 1, 2), align = "hv")
+
+df.bk.gsva.modpath$alive.status <- NA
+df.bk.gsva.modpath$alive.status[df.bk.gsva.modpath$status == "alive"]  <- F
+df.bk.gsva.modpath$alive.status[df.bk.gsva.modpath$status == "dead"] <- T
+mrd.coxph <- coxph(Surv(months, alive.status) ~ score, data = df.bk.gsva.modpath %>% dplyr::filter(grepl("MRD", condition)))
+summary(mrd.coxph)
+
+# visualize
+print(plt.bulk.gsva.modpath)
+
+
+
+
+```
+
+
+```{r crude bulk gsva vs survival}
+
+# get bulk RNA data
+bulk.test <- (df.bulk %>% dplyr::select(-genes))
+rownames(bulk.test) <- df.bulk$genes
+
+ti.ag.set <- list(
+  Ag = ag.set,
+  Ti = ti.set
+)
+
+ 
+# score bulk RNA profiles (GSVA only)
+bulk.poi <- GSVA::gsva(as.matrix(bulk.test), ti.ag.set)
+df.mod.path.bulk <- data.frame(t(bulk.poi))
+df.mod.path.bulk$line <- stringr::str_extract(rownames(df.mod.path.bulk), "[A-Za-z0-9]*")
+df.mod.path.bulk$sample <- rownames(df.mod.path.bulk)
+
+# assign survival data
+df.surv <- data.frame(line = c("BT799", "BT935", "BT954", "BT428", "MBT06"),
+                      months = c(3, 7.5, 14, 16.5, 35), 
+                      status = c("dead", "dead", "dead", "dead", "alive"))
+
+df.mod.path.bulk <- merge(df.mod.path.bulk, df.surv, by = "line")
+
+# generate plots
+my.form <- "y~x"
+plt.bulk.gsva.ag <- df.mod.path.bulk %>%
+    dplyr::filter(sample %in% which.samples) %>%
+    ggplot(aes(x = Ag, y = months, label = line)) +
+    geom_text() + 
+    geom_vline(xintercept = 0, linetype = "dashed") + 
+    theme_miko()+
+    geom_smooth(method = "lm") + 
+    stat_poly_eq(formula = my.form, 
+                 aes(label = paste(..rr.label.., stat(p.value.label),  sep = "~~~")), 
+                 parse = TRUE, rr.digits = 2, p.digits = 2) +
+    labs(title = "Ag", subtitle = paste0(length(ti.ag.set$Ag), " genes")) + 
+  xlab("Ag GSVA score (Bulk RNA)") + 
+  ylab("Survival (Months)")
+ 
+plt.bulk.gsva.ti <-  df.mod.path.bulk %>%
+    dplyr::filter(sample %in% which.samples) %>%
+    ggplot(aes(x = Ti, y = months, label = line)) +
+    geom_text() + 
+    geom_vline(xintercept = 0, linetype = "dashed") + 
+    theme_miko()+
+    geom_smooth(method = "lm") + 
+    stat_poly_eq(formula = my.form, 
+                 aes(label = paste(..rr.label.., stat(p.value.label),  sep = "~~~")), 
+                 parse = TRUE, rr.digits = 2, p.digits = 2) +
+    labs(title = "Ti", subtitle = paste0(length(ti.ag.set$Ti), " genes")) + 
+  xlab("Ti GSVA score (Bulk RNA)") + 
+  ylab("Survival (Months)")
+  
+  
+plt.gsva.suvival.bulk <- cowplot::plot_grid(plt.bulk.gsva.ag, plt.bulk.gsva.ti, ncol = 2, align = "h")
+
+# plt.bulk.gsva.ag
+# plt.bulk.gsva.ti
+
+print(plt.gsva.suvival.bulk)
+
+```
+
+
+
+
+```{r gene expression HEATMAPS, fig.height = 6, fig.width = 6}
+
+# color palette and breakpoints
+my.breaks <- seq(-2, 2, by = 0.02)
+# my.col <- colorRampPalette(c(scales::muted("blue"), "white",scales::muted("red")))(length(my.breaks))
+my.col <- colorRampPalette(rev(brewer.pal(n = 7, name =  "RdBu")))(length(my.breaks))
+
+# annotation data.frame for genes
+df.gene.ann <- bind_rows(data.frame(genes = ag.set, set = "Ag"), data.frame(genes = ti.set, set = "Ti"))
+rownames(df.gene.ann) <- df.gene.ann$genes
+df.gene.ann <- df.gene.ann %>% dplyr::select(-c("genes"))
+
+# TCGA HEATMAP #################################################################
+gbm.mat.sub <- gbm.mat[rownames(gbm.mat) %in% c(ag.set, ti.set), ]
+
+df.col.ann.tcga <- data.frame(sample = colnames(gbm.mat))
+df.col.ann.tcga <- bind_cols(df.col.ann.tcga, gbm.meta.sub)
+df.col.ann.tcga <- df.col.ann.tcga[ ,c("sample", "mgmt.promoter", "alive", "idh.subtype", "t.subtype", "time", "age")]
+rownames(df.col.ann.tcga) <- df.col.ann.tcga$sample
+df.col.ann.tcga <- df.col.ann.tcga %>% dplyr::select(-c("sample"))
+
+df.col.ann.tcga <- df.col.ann.tcga %>% dplyr::arrange(t.subtype)
+gbm.mat.sub <- gbm.mat.sub[ , rownames(df.col.ann.tcga)]
+
+plt.heat.tcga <- pheatmap::pheatmap(gbm.mat.sub, show_colnames = F, scale = "row", 
+                   annotation_col = df.col.ann.tcga, annotation_row = df.gene.ann,
+                   cluster_cols = T, breaks = my.breaks, color = my.col)
+
+plt.heat.tcga <- ggplotify::as.ggplot(plt.heat.tcga)
+
+# BULK HEATMAP #################################################################
+df.bulk.sub <- df.bulk[df.bulk$genes %in% c(ag.set, ti.set), ]
+gene.names <- df.bulk.sub$genes
+#df.bulk.sub <- df.bulk.sub %>% dplyr::select(-c("genes"))
+df.bulk.sub <- df.bulk.sub %>% dplyr::select(which.samples)
+
+df.bulk.ann <- data.frame(line = stringr::str_extract(colnames(df.bulk.sub), "[A-Za-z0-9]*"), sample = colnames(df.bulk.sub))
+  df.bulk.meta <- data.frame(line = c("BT799", "BT935", "BT954", "BT428", "MBT06"),
+                        months = c(3, 7.5, 14, 16.5, 35), 
+                        status = c("dead", "dead", "dead", "dead", "alive"))
+  df.bulk.ann <- merge(df.bulk.ann, df.bulk.meta, by = "line")
+  rownames(df.bulk.ann) <- df.bulk.ann$sample
+  df.bulk.ann <- df.bulk.ann %>% dplyr::select(-c("sample"))
+  df.bulk.ann <- df.bulk.ann %>% dplyr::arrange(months, status)
+df.bulk.sub <- df.bulk.sub[ , rownames(df.bulk.ann)]
+rownames(df.bulk.sub) <- gene.names
+
+# plt.heat.bulk <- pheatmap::pheatmap(df.bulk.sub, show_colnames = T, scale = "row", 
+#                    annotation_col = df.bulk.ann,  annotation_row = df.gene.ann, 
+#                    cluster_cols = F, breaks = my.breaks, color = my.col)
+plt.heat.bulk <- pheatmap::pheatmap(df.bulk.sub, show_colnames = T, scale = "row", 
+                   annotation_col = df.bulk.ann,  annotation_row = df.gene.ann, 
+                   cluster_cols = F, breaks = my.breaks, color = colorRampPalette(rev(brewer.pal(n = 10, name = "RdYlGn")))(length(my.breaks)))
+
+plt.heat.bulk <- ggplotify::as.ggplot(plt.heat.bulk)
+
+# scRNAseq HEATMAP #############################################################
+
+e.mat <- getExpressionMatrix(so.query,  which.data = "data")
+cell.names <- colnames(e.mat)
+e.mat <- e.mat[rownames(e.mat) %in% c(ag.set, ti.set), ] # colnames(e.mat) %in% c(group.1,group.2)
+colnames(e.mat) <- cell.names
+
+df.ann <- data.frame(sample = so.query@meta.data[["Barcode"]], cell = colnames(so.query))
+rownames(df.ann) <- colnames(so.query)
+
+df.gbmstat <- data.frame(cell = rownames(df.state), subtype = df.state$subtype)
+df.ann <- merge(df.ann, df.gbmstat, by = "cell")
+cell.names <- df.ann$cell
+df.ann <- df.ann %>% dplyr::select(-c("cell"))
+rownames(df.ann) <- cell.names
+
+df.ann$sample <- factor(df.ann$sample, levels = c("ctrl.0231", "TR.0231", "ctrl.0238", "TR.0238"))
+df.ann <- df.ann %>% dplyr::arrange(sample, subtype)
+e.mat <- e.mat[ , rownames(df.ann)]
+
+aka3 = list(sample = c(ctrl.0231 = c0231.col, TR.0231 = t0231.col, ctrl.0238 = c0238.col, TR.0238 = t0238.col))
+
+
+e.mat.scale <- t(apply(e.mat, 1, function(x) (x-mean(x, na.rm = T))/sd(x, na.rm = T)))
+e.mat.scale <- MinMax(e.mat.scale, -5,5)
+
+scale.lim <- max(abs(e.mat.scale))
+my.breaks <- seq(-scale.lim, scale.lim, by = 2*scale.lim/100)
+
+plt.heat.sc <- pheatmap::pheatmap(e.mat.scale, 
+                   annotation_col = df.ann,  annotation_row = df.gene.ann, 
+                   show_colnames =F,
+                   fontsize = 8,
+                   cluster_cols = F,
+                   # scale = "row",
+                    annotation_colors = aka3,
+                   breaks = my.breaks,
+                   color = colorRampPalette(rev(brewer.pal(n = 10, name = "RdBu")))(100))
+plt.heat.sc <- ggplotify::as.ggplot(plt.heat.sc)
+plt.heat.sc
+
+
+plt.heat.sc <- miko_heatmap(e.mat.scale,  annotation_col = df.ann,  annotation_row = df.gene.ann, show_colnames =F,
+                   fontsize = 8,
+                   scale.lim = 3,
+                   cluster_cols = F)
+
+plt.heat.sc
+
+
+# savePDF("Fig4D_signature_heatmap.pdf", plt.heat.sc, fig.height = 6, fig.width = 6)
+
+```
+
+```{r Kaplan-Meier survival curves, fig.width = 12, fig.height = 4}
+
+gbm.mat.sub <- gbm.mat[rownames(gbm.mat) %in% unique(c(ag.set, ti.set)), ]
+df.tcga.gsva.modpath <- TCGAscores(gbm.mat,so.sig.set = NULL, gbm.meta.sub, deg.gene.sets = list(
+  set1 = ag.set ,
+  set2 = ti.set
+))
+
+df.surv <- df.tcga.gsva.modpath
+df.surv$status <- NA
+df.surv$status[df.surv$alive == "Alive"] <- FALSE
+df.surv$status[df.surv$alive == "Dead"] <- TRUE
+
+df.surv$time <- df.surv$dtf
+# df.surv$time[!is.na(df.surv$dtd)] <-df.surv$dtd[!is.na(df.surv$dtd)]
+# 
+df.surv <- df.surv[!is.na(df.surv$time), ]
+df.surv <- df.surv[!is.na(df.surv$status), ]
+
+# Kaplan-Meier #################################################################
+surv.obj <- Surv(df.surv$time, df.surv$status)
+
+binQuant <- function(x, probs = c(0.25, 0.5, 0.75)){
+#  c(0.25, 0.5, 0.75)
+  probs <- probs[order(probs)]
+  
+  quant <- quantile(x, probs =probs)
+  
+  y <- rep(NA, length(x))
+  
+  y[x<=quant[1]] <- "q1"
+  y[x> quant[1] & x<=quant[2]] <- "q2"
+  y[x> quant[2] & x<=quant[3]] <- "q3"
+  y[x>quant[3]] <- "q4"
+
+  return(y)
+}
+
+  
+prepInteractionTerm <- function(df.surv.clean, which.score){
+  df.surv.clean$high.low <- df.surv.clean[ ,which.score] >= 0
+  score.val <- unlist(df.surv.clean[ ,which.score])
+  df.surv.clean$score.level <- "low"
+  df.surv.clean$score.level[df.surv.clean$high.low] <- "high"
+  df.surv.clean$score.bin <- paste0(df.surv.clean$t.subtype,".", df.surv.clean$score.level)
+  df.surv.clean$score.bin <- factor(df.surv.clean$score.bin, levels = c("CL.low", "CL.high", "ME.low", "ME.high",
+                                                                        "NE.low", "NE.high", "PN.low", "PN.high"))
+  return(df.surv.clean)
+}
+
+skip <- T
+if (!skip){
+  df.surv$score.status <- binQuant(df.surv$score)
+df.surv <- prepInteractionTerm(df.surv, "score")
+
+df.surv$y1.status <- "q1"
+df.surv$y1.status[ df.surv$y1 >= quantile( df.surv$y1, 1/4)] <- "q2"
+df.surv$y1.status[ df.surv$y1 >= quantile( df.surv$y1, 2/4)] <- "q3"
+df.surv$y1.status[ df.surv$y1 >= quantile( df.surv$y1, 3/4)] <- "q4"
+df.surv$y2.status <- "q1"
+df.surv$y2.status[ df.surv$y2 >= quantile( df.surv$y2, 1/4)] <- "q2"
+df.surv$y2.status[ df.surv$y2 >= quantile( df.surv$y2, 2/4)] <- "q3"
+df.surv$y2.status[ df.surv$y2 >= quantile( df.surv$y2, 3/4)] <- "q4"
+df.surv$score.status <- "q1"
+df.surv$score.status[ df.surv$score >= quantile( df.surv$score, 1/4)] <- "q2"
+df.surv$score.status[ df.surv$score >= quantile( df.surv$score, 2/4)] <- "q3"
+df.surv$score.status[ df.surv$score >= quantile( df.surv$score, 3/4)] <- "q4"
+
+plt.surv.score <- ggsurvplot(survfit(surv.obj ~ score.status , data = df.surv),
+           conf.int = F, pval = T, risk.table = F,
+           title = "Kaplan-Meier: Composite Score", surv.median.line = "hv")
+
+plt.surv.y1 <- ggsurvplot(survfit(surv.obj ~ y1.status , data = df.surv),
+           conf.int = F, pval = T, risk.table = F,
+           title = "Kaplan-Meier: Ag Score", surv.median.line = "hv")
+
+plt.surv.y2 <- ggsurvplot(survfit(surv.obj ~ y2.status , data = df.surv),
+           conf.int = F, pval = T, risk.table = F,
+           title = "Kaplan-Meier: Ti Score", surv.median.line = "hv")
+
+plt.crude.KM <- arrange_ggsurvplots(list(plt.surv.score, plt.surv.y1, plt.surv.y2), ncol = 3)
+
+plt.crude.KM
+
+df.surv %>%
+  ggplot(aes(x = y1, y = y2, color = score)) + 
+  geom_point()
+}
+
+
+# plt.surv.y1
+
+```
+
+```{r, fig.width=14, fig.height=5}
+
+# df.surv_v2 <- df.surv
+df.surv_v1 <- df.surv %>% dplyr::filter(t.subtype %in% c("CL", "ME"))
+surv.obj_v1 <- Surv(df.surv_v1$time, df.surv_v1$status)
+plt.surv.auc_v1 <- ggsurvplot(survfit(surv.obj_v1 ~ auc.nm, data = df.surv_v1),
+           conf.int = F, pval = T, risk.table = F,
+           title = "Kaplan-Meier: Composite Score", surv.median.line = "hv")
+
+
+plt.surv.auc_v1 <- plt.surv.auc_v1[["plot"]]  + theme_miko(legend = T, color.palette = "ptol") + labs(subtitle = "CL + ME") + 
+  theme(legend.position = "bottom")
+
+
+df.surv_v2 <- df.surv %>% dplyr::filter(t.subtype %in% c("NE", "PN"))
+surv.obj_v2 <- Surv(df.surv_v2$time, df.surv_v2$status)
+plt.surv.auc_v2 <- ggsurvplot(survfit(surv.obj_v2 ~ auc.nm, data = df.surv_v2),
+           conf.int = F, pval = T, risk.table = F,
+           title = "Kaplan-Meier: Composite Score", surv.median.line = "hv")
+
+plt.surv.auc_v2 <- plt.surv.auc_v2[["plot"]]  + theme_miko(legend = T, color.palette = "ptol") + labs(subtitle = "NE + PN")  + 
+  theme(legend.position = "bottom")
+
+df.surv_v3 <- df.surv 
+surv.obj_v3 <- Surv(df.surv_v3$time, df.surv_v3$status)
+plt.surv.auc_v3 <- ggsurvplot(survfit(surv.obj_v3 ~ auc.nm, data = df.surv_v3),
+           conf.int = F, pval = T, risk.table = F,
+           title = "Kaplan-Meier: Composite Score", surv.median.line = "hv")
+
+plt.surv.auc_v3 <- plt.surv.auc_v3[["plot"]] + theme_miko(legend = T, color.palette = "ptol") + labs(subtitle = "all GBM")  + 
+  theme(legend.position = "bottom")
+# plt.surv.auc_v3
+
+
+# as_ggplot(plt.surv.auc_v1)
+cowplot::plot_grid(plt.surv.auc_v1, plt.surv.auc_v2, plt.surv.auc_v3, ncol = 3)
+
+
+df.surv_ag <- df.surv
+
+# df.surv_ag <- df.surv %>% dplyr::filter(t.subtype %in% c("CL", "ME"))
+df.surv_ag <- df.surv %>% dplyr::filter(t.subtype %in% c("CL", "ME")) #, "PN"
+surv.obj_ag <- Surv(df.surv_ag$time, df.surv_ag$status)
+plt.surv.auc_ag <- ggsurvplot(survfit(surv.obj_ag ~ ag.auc, data = df.surv_ag),
+           conf.int = F, pval = T, risk.table = F,
+           title = "Kaplan-Meier: Ag", surv.median.line = "hv")
+
+
+plt.surv.auc_ag <- plt.surv.auc_ag[["plot"]]  + theme_miko(legend = T, color.palette = "ptol") + labs(subtitle = "CL + ME") + 
+  theme(legend.position = "bottom")
+# plt.surv.auc_ag
+
+df.surv_ti <- df.surv 
+# df.surv_ti <- df.surv %>% dplyr::filter(t.subtype %in% c("CL", "ME"))
+df.surv_ti <- df.surv %>% dplyr::filter(t.subtype %in% c("CL", "ME")) #, "PN"
+surv.obj_ti <- Surv(df.surv_ti$time, df.surv_ti$status)
+plt.surv.auc_ti <- ggsurvplot(survfit(surv.obj_ti ~ ti.auc, data = df.surv_ti),
+           conf.int = F, pval = T, risk.table = F,
+           title = "Kaplan-Meier: Ti", surv.median.line = "hv")
+
+# df.surv_ti$ti.auc
+# plt.surv.auc_ti <- plt.surv.auc_ti[["plot"]]  + theme_miko(legend = T, color.palette = "ptol") + labs(subtitle = "CL + ME") + 
+#   theme(legend.position = "bottom")
+# 
+# 
+# cowplot::plot_grid(plt.surv.auc_ag, plt.surv.auc_ti, ncol = 2)
+
+
+```
+
+
+
+```{r}
+
+survivalPanel <- function(df.data, which.score){
+  
+
+  do.conf.int <- F
+  do.p.val <- TRUE
+    
+      df.data$high.low <- df.data[ ,which.score] >= 0
+  score.val <- unlist(df.data[ ,which.score])
+  df.data$score.level <- "low"
+  df.data$score.level[df.data$high.low] <- "high"
+  
+  df.cl <- df.data %>% dplyr::filter(t.subtype == "CL")
+  plt.uni.score.cl <- survminer::ggsurvplot(fit = survival::survfit(Surv(time, status) ~ score.level , data = df.cl), 
+                                 conf.int = do.conf.int, pval = do.p.val, risk.table = F,data = df.cl,
+                                 title = paste0("Kaplan-Meier: Classical\n", which.score), surv.median.line = "hv")
+  
+  df.me <- df.data %>% dplyr::filter(t.subtype == "ME")
+  plt.uni.score.me <- survminer::ggsurvplot(fit = survival::survfit(Surv(time, status) ~ score.level , data = df.me),
+                                 conf.int = do.conf.int, pval = do.p.val, risk.table = F,  data = df.me,
+                                 title = paste0("Kaplan-Meier: Mesenchymal\n", which.score), surv.median.line = "hv")
+
+  df.ne <- df.data %>% dplyr::filter(t.subtype == "NE")
+  plt.uni.score.ne <- survminer::ggsurvplot(fit = survival::survfit(Surv(time, status) ~ score.level , data = df.ne),
+                                 conf.int = do.conf.int, pval = do.p.val, risk.table = F,data = df.ne,
+                                 title = paste0("Kaplan-Meier: Neural\n", which.score), surv.median.line = "hv")
+
+  df.pn <- df.data %>% dplyr::filter(t.subtype == "PN")
+  plt.uni.score.pn <- survminer::ggsurvplot(fit = survival::survfit(Surv(time, status) ~ score.level , data = df.pn),
+                                 conf.int = do.conf.int, pval = do.p.val, risk.table = F,data = df.pn,
+                                 title = paste0("Kaplan-Meier: Proneural\n", which.score), surv.median.line = "hv")
+
+  return(list(plt1 = plt.uni.score.cl, 
+              plt2 = plt.uni.score.me,
+              plt3 =plt.uni.score.ne, 
+              plt4 = plt.uni.score.pn))
+}
+  
+```
+
+```{r, fig.width = 15, fig.height = 4}
+
+if (!skip){
+  df.surv.input12 <- df.surv[ ,c("t.subtype", "score", "time", "status", "idh.subtype")]
+
+km.score.list12 <- survivalPanel(df.data = df.surv.input12 , which.score = "score")
+plt.cruge.km.subtypeStrata12 <- arrange_ggsurvplots(km.score.list12, ncol = 4)
+
+df.surv.input1 <- df.surv[ ,c("t.subtype", "y1", "time", "status", "idh.subtype")]
+colnames(df.surv.input1) <- c("t.subtype", "Ag", "time", "status", "idh.subtype")
+km.score.list1 <- survivalPanel(df.data = df.surv.input1 , which.score = "Ag")
+plt.cruge.km.subtypeStrata1 <- arrange_ggsurvplots(km.score.list1, ncol = 4)
+
+df.surv.input2 <- df.surv[ ,c("t.subtype", "y2", "time", "status", "idh.subtype")]
+colnames(df.surv.input2) <- c("t.subtype", "Ti", "time", "status", "idh.subtype")
+km.score.list2 <- survivalPanel(df.data = df.surv.input2 , which.score = "Ti")
+plt.cruge.km.subtypeStrata2 <- arrange_ggsurvplots(km.score.list2, ncol = 4)
+
+
+plt.cruge.km.subtypeStrata12
+plt.cruge.km.subtypeStrata1
+plt.cruge.km.subtypeStrata2
+
+}
+
+```
+
+
+```{r tcga forest plots}
+
+if (!skip){
+  t.types <- unique(as.character(df.surv$t.subtype))
+t.types <- t.types[!is.na(t.types)]
+# Prepare Data
+
+for (i in 1:length(t.types)){
+  df.surv.clean <- df.surv %>% dplyr::filter(t.subtype == t.types[i])
+  # df.surv.clean <- df.surv 
+  df.surv.clean$age <- df.surv.clean$age/365
+  surv.obj <- Surv(df.surv.clean$time, df.surv.clean$status)
+  
+  df.surv.clean <- prepInteractionTerm(df.surv.clean, "score")
+  
+  cfit.adj.strata <- coxph((surv.obj) ~ y1+ y2 , data = df.surv.clean) #t.subtype*y1 + t.subtype*y2 +
+  plt.forest.score <- ggforest(cfit.adj.strata, data = df.surv.clean, main = paste0("TCGA CoxPH model: ", t.types[i])) 
+  print(plt.forest.score)
+}
+
+}
+
+
+```
+
+```{r run coxph models and generate forest plots, fig.height = 5, fig.width = 8}
+
+
+if (!skip){
+  
+df.surv.clean <- df.surv 
+
+df.surv.clean$age <- df.surv.clean$age/365
+surv.obj <- Surv(df.surv.clean$time, df.surv.clean$status)
+
+# stratified data ##############################################################
+# age +  
+# SCORE
+# t.subtype*score
+df.surv.clean <- prepInteractionTerm(df.surv.clean, "score")
+cfit.adj.noscore.strata <- coxph((Surv(time, status)) ~ score + t.subtype + age + idh.subtype + mgmt.promoter, data = df.surv.clean ) 
+plt.forest.noscore <- ggforest(cfit.adj.noscore.strata, main = "TCGA CoxPH no score Model") 
+
+# %>% dplyr::filter(t.subtype =="CL")
+print(plt.forest.noscore)
+}
+
+```
+
+
+
+```{r score vs clinical characteristics , fig.width = 9, fig.height = 6}
+
+if (!skip){
+
+# function to visualize scores stratified by GBM clinical characteristics ######
+stratifiedScorePlots <- function(df.tcga.scores, which.score, score.label){
+  
+  res.aov1 <- signif(summary(aov(get(which.score) ~ t.subtype, dplyr::filter(df.tcga.scores, !is.na(t.subtype))))[[1]][["Pr(>F)"]][1], 3)
+  plt.tcga.strata1 <- df.tcga.scores %>%
+    dplyr::filter(!is.na(t.subtype)) %>%
+    ggplot(aes(x = t.subtype, y = get(which.score), fill = t.subtype)) + 
+    geom_boxplot() + 
+    theme_miko() + ylab(score.label) + xlab("GBM Subtype") +
+  ggthemes::scale_fill_economist() + 
+    geom_hline(yintercept = 0, linetype = "dashed") + 
+    labs(title = "GBM Subtype", subtitle = paste0("p=", res.aov1))
+  
+  res.aov2 <- signif(summary(aov(get(which.score) ~ ch7.10, dplyr::filter(df.tcga.scores, !is.na(ch7.10))))[[1]][["Pr(>F)"]][1], 3)
+  plt.tcga.strata2 <- df.tcga.scores %>%
+    dplyr::filter(!is.na(ch7.10)) %>%
+    ggplot(aes(x = ch7.10, y = get(which.score), fill = ch7.10)) + 
+    geom_boxplot() + 
+    theme_miko() + ylab(score.label) + xlab("Ch7/Ch10 CNV") +
+  ggthemes::scale_fill_economist() + 
+    geom_hline(yintercept = 0, linetype = "dashed") + 
+    labs(title = "Ch7 and Ch10 CNV", subtitle = paste0("p=", res.aov2))
+  
+  res.aov3 <- signif(summary(aov(get(which.score) ~ ch19.20, dplyr::filter(df.tcga.scores, !is.na(ch19.20))))[[1]][["Pr(>F)"]][1], 3)
+  plt.tcga.strata3 <- df.tcga.scores %>%
+    dplyr::filter(!is.na(ch19.20)) %>%
+    ggplot(aes(x = ch19.20, y = get(which.score), fill = ch19.20)) + 
+    geom_boxplot() + 
+    theme_miko() + ylab(score.label) + xlab("Ch19/Ch20 CNV") + 
+  ggthemes::scale_fill_economist() + 
+    geom_hline(yintercept = 0, linetype = "dashed") + 
+    labs(title = "Ch19 and Ch20 CNV", subtitle = paste0("p=", res.aov3))
+  
+  res.aov4 <- signif(summary(aov(get(which.score) ~ mgmt.promoter, dplyr::filter(df.tcga.scores, !is.na(mgmt.promoter))))[[1]][["Pr(>F)"]][1], 3)
+  plt.tcga.strata4 <- df.tcga.scores %>%
+    dplyr::filter(!is.na(mgmt.promoter)) %>%
+    ggplot(aes(x = mgmt.promoter, y = get(which.score), fill = mgmt.promoter)) + 
+    geom_boxplot() + 
+    theme_miko() + ylab(score.label) + xlab("MGMT Promoter") +
+  ggthemes::scale_fill_economist() + 
+    geom_hline(yintercept = 0, linetype = "dashed") + 
+    labs(title = "MGMT promoter", subtitle = paste0("p=", res.aov4))
+  
+  res.aov5 <- signif(summary(aov(get(which.score) ~ idh.subtype, dplyr::filter(df.tcga.scores, !is.na(idh.subtype))))[[1]][["Pr(>F)"]][1], 3)
+  plt.tcga.strata5 <- df.tcga.scores %>%
+    dplyr::filter(!is.na(idh.subtype)) %>%
+    ggplot(aes(x = idh.subtype, y = get(which.score), fill = idh.subtype)) + 
+    geom_boxplot() + 
+    theme_miko() + ylab(score.label) + xlab("IDH Status") +
+  ggthemes::scale_fill_economist() + 
+    geom_hline(yintercept = 0, linetype = "dashed") + 
+    labs(title = "IDH Status", subtitle = paste0("p=", res.aov5))
+  
+  res.aov6 <- signif(summary(aov(get(which.score) ~ age, dplyr::filter(df.tcga.scores, !is.na(age))))[[1]][["Pr(>F)"]][1], 3)
+  plt.tcga.strata6 <- df.tcga.scores %>%
+    dplyr::filter(!is.na(idh.subtype)) %>%
+    ggplot(aes(x = age/365, y = get(which.score))) + 
+    theme_miko() + ylab(score.label) + xlab("Age (years)") +
+  geom_smooth(method = "lm", color = "grey") + 
+    geom_point() + 
+    geom_hline(yintercept = 0, linetype = "dashed") + 
+    labs(title = "Age", subtitle = paste0("p=", res.aov6))
+  
+  plt.tcga.score <- cowplot::plot_grid(plt.tcga.strata1, plt.tcga.strata2, plt.tcga.strata3,
+                                       plt.tcga.strata4, plt.tcga.strata5, plt.tcga.strata6, ncol =3)
+  
+  return(plt.tcga.score)
+}
+
+# generate plots
+plt.strat.score <- stratifiedScorePlots(df.tcga.scores = df.surv, which.score = "score", score.label = "Ag-Ti Composite Score")
+plt.strat.y1 <- stratifiedScorePlots(df.tcga.scores = df.surv, which.score = "y1", score.label = "Ag Score")
+plt.strat.y2 <- stratifiedScorePlots(df.tcga.scores = df.surv, which.score = "y2", score.label = "Ti Score")
+
+# visualize
+plt.strat.score
+plt.strat.y1
+plt.strat.y2
+
+  
+}
+
+```
+
+
+
+
+
+```{r DEG heatmap, fig.height=7, fig.width= 5}
+
+# function to generate DEG heatmap
+degHeatmap <- function(so.query, gene.list, df.state, group.1.query, group.2.query, group.1.label, group.2.label, scale.hm = F, log.hm = F, color.hm = viridis::inferno, breaks.hm = NA){
+  
+  e.mat <- getExpressionMatrix(
+  so.query,
+  only.variable = F,
+  which.assay = NULL,
+  which.data = "data",
+  use.additional.genes = NA
+)
+
+
+# get cell ind
+group.1 <-  colnames(so.query)[so.query@meta.data[["Barcode"]] %in% group.1.query]
+group.2 <- colnames(so.query)[so.query@meta.data[["Barcode"]] %in% group.2.query]
+
+deg.mat <- e.mat[rownames(e.mat) %in%gene.list, colnames(e.mat) %in% c(group.1,group.2)]
+df.line <- data.frame(cell = c(group.1,group.2))
+df.line$line[df.line$cell %in% group.1] <- group.1.label
+df.line$line[df.line$cell %in% group.2] <- group.2.label
+rownames(df.line) <- df.line$cell
+
+# get GBM subtypes
+df.gbmstat <- data.frame(cell = rownames(df.state), subtype = df.state$subtype)
+df.line <- merge(df.line, df.gbmstat, by = "cell")
+df.line.ann <- df.line %>% dplyr::select("line", "subtype")
+rownames(df.line.ann) <- df.line$cell
+
+if (nrow(deg.mat) != length(gene.list)) stop("DEG genes not found in seurat object")
+
+if (log.hm) deg.mat <- log1p(deg.mat)
+if (scale.hm){
+  deg.mat <- t(apply(deg.mat, 1, function(x) (x-mean(x, na.rm = T)) / sd(x, na.rm = T)))
+}
+
+if (is.na(breaks.hm) & (min(deg.mat) < 0)){
+  scale.limit <- max(c(abs(max(deg.mat)), abs(min(deg.mat))))
+  if (scale.limit > 3) scale.limit <- 3
+  breaks.hm <- seq(-scale.limit, scale.limit, (scale.limit/10))
+  n.col <- length(breaks.hm)
+} else {
+  n.col <- 10
+}
+
+deg.hm <- pheatmap::pheatmap(deg.mat, 
+                             color= color.hm(n.col), 
+                             annotation_col = df.line.ann, 
+                             show_colnames =F,
+                             fontsize = 8,
+                             breaks = breaks.hm,
+                             silent = T)
+
+plt.deg.hm.final <- ggplotify::as.ggplot(deg.hm)
+
+
+
+return(list(
+  plot = plt.deg.hm.final,
+  data = deg.mat
+))
+}
+
+
+# Ag and Ti heatmaps (scaled)
+deg.hm.output.ag.ti.scale <- degHeatmap(so.query, gene.list = c(ti.set, ag.set), df.state = df.state, 
+                                        group.1.query = "ctrl.0231", group.2.query = "ctrl.0238", 
+                                        group.1.label = "MBT06", group.2.label = "BT799", scale.hm = T,log.hm = F, color.hm = colorRampPalette(c(scales::muted("blue"), "white",scales::muted("tomato"))))
+deg.hm.output.ag.ti.scale$plot
+
+# Ag and Ti heatmaps (not scaled)
+deg.hm.output.ag.ti.data <- degHeatmap(so.query, gene.list = c(ti.set, ag.set), df.state = df.state, 
+                                       group.1.query = "ctrl.0231", group.2.query = "ctrl.0238", 
+                                       group.1.label = "MBT06", group.2.label = "BT799",scale.hm = F,log.hm = F)
+deg.hm.output.ag.ti.data$plot
+
+```
+
+
+```{r ti-ag module activities projected on UMAP, fig.width=10, fig.height=4}
+
+# helper function
+pseudotime.UMAP <- function(x, y, pseudotime, pt.size = autoPointSize(length(pseudotime)), pt.alpha = 1, x.lab = "UMAP 1", y.lab = "UMAP 2"){
+
+  df <- data.frame(x,y,pseudotime)
+
+  plt.pt <- df %>%
+    ggplot(aes(x, y, color = pseudotime)) +
+    geom_point(size = pt.size, alpha = pt.alpha) +
+    theme_classic() +
+    xlab(x.lab) +
+    ylab(y.lab) +
+    viridis::scale_color_viridis()
+
+  return(plt.pt)
+
+}
+
+
+# get genesets
+ti.ag.set <- list(
+  ag = ag.set, 
+  ti = ti.set
+)
+
+# compute module scores #######################################################
+ti.ag.gsva <- matrix(ncol = ncol(so.query), nrow = length(ti.ag.set))
+for (i in 1:length(ti.ag.set)){
+  
+  set.name <- names(ti.ag.set)[i]
+  set.list <- ti.ag.set[[i]]
+  so.mod <- so.query
+  
+  set.list <- set.list[(set.list) %in% rownames(so.query)]
+  
+  so.mod <- AddModuleScore(
+    so.mod, features = list(set.list),
+    nbin = 20, ctrl = 100,
+    k = FALSE, assay = NULL,
+    name = set.name,
+    seed = 1, search = FALSE
+  )
+  
+  ti.ag.gsva[i ,] <- so.mod@meta.data[[paste0(set.name, "1")]]
+  
+}
+
+rm(so.mod)
+
+# generate UMAPs ###############################################################
+
+# get umap embedding
+umap.x <- so.query@reductions[["umap"]]@cell.embeddings[ ,1]
+umap.y <- so.query@reductions[["umap"]]@cell.embeddings[ ,2]
+
+plt.ti.ag.umap <- list()
+for (i in 1:length(ti.ag.set)){
+  plt.ti.ag.umap[[names(ti.ag.set)[i]]] <- pseudotime.UMAP(x = umap.x, y = umap.y, 
+                                                           pseudotime = ti.ag.gsva[i ,],
+                                                           pt.size = 1) + 
+    labs(title = "GBM", subtitle = (firstup(names(ti.ag.set)[i])), color = "Activity") + 
+    scale_colour_distiller(palette ="RdBu", direction = -1) +
+    # scale_color_gradient2(low = scales::muted("blue"), high = scales::muted("red")) + 
+    theme_miko(legend = if(i==1) F else T)
+}
+
+# merge plots
+plt.ti.ag1 <- cowplot::plot_grid(plotlist = plt.ti.ag.umap, rel_widths = c(1,1.2))
+
+bc <- so.query@meta.data[["Barcode"]]
+u.bc <- unique(bc)
+csub.mod.bc <- matrix(nrow = length(u.bc), ncol = length(ti.ag.set))
+for (i in 1:length(u.bc)){
+  which.cells <- bc %in% u.bc[i]
+  csub.mod.bc[i,] <- colMeans(t(ti.ag.gsva)[which.cells ,])
+}
+
+colnames(csub.mod.bc) <- names(ti.ag.set)
+rownames(csub.mod.bc) <- u.bc
+
+df.mod.gbm <- data.frame(csub.mod.bc)
+df.mod.gbm$time <- rownames(df.mod.gbm)
+
+# heatmap ######################################################################
+df.col.ann <- data.frame(sample = rownames(csub.mod.bc))
+rownames(df.col.ann) <- rownames(csub.mod.bc)
+df.col.ann$line <- NA
+df.col.ann$line[grepl("0231", df.col.ann$sample)] <- "MBT06"
+df.col.ann$line[grepl("0238", df.col.ann$sample)] <- "BT799"
+df.col.ann <- df.col.ann %>% dplyr::select("line")
+
+
+
+
+# scale data
+csub.mod.bc.scaled <- apply(csub.mod.bc, 2, function(x) (x - mean(x)) / sd(x))
+scale.limit <- max(c(abs(max(csub.mod.bc.scaled)), abs(min(csub.mod.bc.scaled))))
+my.breaks <- seq(-scale.limit,scale.limit, by = 0.05)
+
+# heatmap
+aka3 = list(line = c(BT799 =  BT799.color, MBT06=MBT06.color))
+
+
+hm.csub.tiag <- pheatmap::pheatmap((csub.mod.bc.scaled), 
+                                   annotation_row = df.col.ann, 
+                                   breaks = my.breaks,
+                                   scale = "none",
+                                  color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(length(my.breaks)),  #"BrBG"
+                                  annotation_colors = aka3,
+                                   cluster_rows = F,
+                                   cluster_cols = F,
+                                  silent = T)
+
+
+plt.ti.ag2 <- ggplotify::as.ggplot(hm.csub.tiag) 
+  # scale_fill_gradient2("gsva", high = scales::muted("red"), low = scales::muted("blue"))
+
+# merge plots
+plt.ti.ag.combo <- cowplot::plot_grid(plt.ti.ag1, plt.ti.ag2, rel_widths = c(2,1))
+
+# visualize
+print(plt.ti.ag.combo)
+
+
+colors <- c("Ag" = ggthemes::economist_pal()(2)[1], "Ti" = ggthemes::economist_pal()(2)[2])
+
+df.mod.gbm$condition <- NA
+df.mod.gbm$condition[grepl("ctrl", df.mod.gbm$time)] <- "Ctrl"
+df.mod.gbm$condition[grepl("TR", df.mod.gbm$time)] <- "TR"
+
+df.mod.gbm$sample <- NA
+df.mod.gbm$sample[grepl("0231", df.mod.gbm$time)] <- "MBT06"
+df.mod.gbm$sample[grepl("0238", df.mod.gbm$time)] <- "BT799"
+
+df.mod.gbm$condition <- factor(df.mod.gbm$condition, levels = c("Ctrl", "TR"))
+
+# get difference annotation ##################################################
+ag.p2 <- df.mod.gbm$ag[df.mod.gbm$condition == "Ctrl" & df.mod.gbm$sample == "MBT06"]
+ag.p3 <- df.mod.gbm$ag[df.mod.gbm$condition == "TR" & df.mod.gbm$sample == "MBT06"]
+ag.dif <- signif(ag.p3-ag.p2, 3)
+
+ti.p2 <- df.mod.gbm$ti[df.mod.gbm$condition == "Ctrl" & df.mod.gbm$sample == "MBT06"]
+ti.p3 <- df.mod.gbm$ti[df.mod.gbm$condition == "TR" & df.mod.gbm$sample == "MBT06"]
+ti.dif <- signif(ti.p3-ti.p2, 3)
+
+df.delta.gbm1 <- data.frame(
+  condition = "TR",
+  sample = "MBT06",
+  delta = c(ag.dif, ti.dif),
+  y = c(0.7*ag.p3, 1.2*ti.p3)
+)
+
+ag.p2 <- df.mod.gbm$ag[df.mod.gbm$condition == "Ctrl" & df.mod.gbm$sample == "BT799"]
+ag.p3 <- df.mod.gbm$ag[df.mod.gbm$condition == "TR" & df.mod.gbm$sample == "BT799"]
+ag.dif <- signif(ag.p3-ag.p2, 3)
+
+ti.p2 <- df.mod.gbm$ti[df.mod.gbm$condition == "Ctrl" & df.mod.gbm$sample == "BT799"]
+ti.p3 <- df.mod.gbm$ti[df.mod.gbm$condition == "TR" & df.mod.gbm$sample == "BT799"]
+ti.dif <- signif(ti.p3-ti.p2, 3)
+
+df.delta.gbm2 <- data.frame(
+  condition = "TR",
+  sample = "BT799",
+  delta = c(ag.dif, ti.dif),
+  y = c(0.7*ag.p3, 1.2*ti.p3)
+)
+
+df.delta.gbm <- bind_rows(df.delta.gbm1, df.delta.gbm2)
+
+plt.time.gbm <- df.mod.gbm %>%
+  ggplot() + 
+  geom_point(aes(x = condition, y = ag, color = "Ag"), size =2) + 
+  geom_path(aes(x = condition, y = ag, group = 1, color = "Ag")) + 
+  geom_point(aes(x = condition, y = ti, color = "Ti"), size =2) + 
+  geom_path(aes(x = condition, y = ti, group = 1, color = "Ti")) + 
+  xlab("Sample") + 
+  ylab("Signature Activity") + 
+  theme_miko(legend = T) + 
+  geom_text(data = df.delta.gbm, aes(x = condition, y= y, label = delta), size = 3) +
+  facet_wrap(~sample) +
+  geom_hline(yintercept = 0, linetype = "dashed") + 
+  labs(title = "GBM", subtitle = "Signature Activity Scores", color = "Signature")+
+    scale_color_manual(values = colors) 
+
+# plt.time.gbm
+
+
+
+
+ 
+ 
+ # savePDF("Fig4E_signature_score_UMAP_010721.pdf", plt.ti.ag.combo,  fig.width=10, fig.height=3)
+
+```
+
+```{r melanoma analysis}
+# load query dataset
+load(paste0(dir.root, dir.preprocessed, "R291_M01_NM2_Rambow_Melanoma_221120.Rdata"));
+so.melanoma <- prepSeurat(so); rm(so)
+
+so.melanoma@meta.data[["bc"]] <- NA
+so.melanoma@meta.data[["bc"]][so.melanoma@meta.data[["orig.ident"]] %in% "T0"] <- "T0"
+so.melanoma@meta.data[["bc"]][so.melanoma@meta.data[["orig.ident"]] %in% "T4"] <- "phase1"
+so.melanoma@meta.data[["bc"]][so.melanoma@meta.data[["orig.ident"]] %in% "T28"] <- "phase2"
+so.melanoma@meta.data[["bc"]][so.melanoma@meta.data[["orig.ident"]] %in% "Tres"] <- "phase3"
+
+# reprocess melanoma 
+so.melanoma <- SCTransform(object = so.melanoma)
+so.melanoma <- RunPCA(so.melanoma, verbose = FALSE)
+
+# specify number of PCA components to use for downstream analysis
+pca.var.threshold <- 0.9
+pca.prop <- propVarPCA(so.melanoma)
+nDim <- max(pca.prop$pc.id[pca.prop$pc.cum_sum<pca.var.threshold])+1
+cluster_resolution <- 1
+so.melanoma <- FindNeighbors(object = so.melanoma, reduction = "pca", dims = 1:nDim)
+so.melanoma <- FindClusters(object = so.melanoma, resolution = cluster_resolution, verbose = 0, algorithm = 1, modularity.fxn = 1)
+so.melanoma <- RunUMAP(so.melanoma, dims = 1:nDim)
+
+
+ti.ag.gsva.mel <- matrix(ncol = ncol(so.melanoma), nrow = length(ti.ag.set))
+for (i in 1:length(ti.ag.set)){
+  
+  set.name <- names(ti.ag.set)[i]
+  set.list <- ti.ag.set[[i]]
+  so.mod.mel <- so.melanoma
+  
+  set.list <- set.list[(set.list) %in% rownames(so.melanoma)]
+  
+  so.mod.mel <- AddModuleScore(
+    so.mod.mel, features = list(set.list),
+    nbin = 20, ctrl = 100,
+    k = FALSE, assay = NULL,
+    name = set.name,
+    seed = 1, search = FALSE
+  )
+  
+  ti.ag.gsva.mel[i ,] <- so.mod.mel@meta.data[[paste0(set.name, "1")]]
+  
+}
+
+rm(so.mod.mel)
+
+# generate UMAPs ###############################################################
+
+# get umap embedding
+umap.x <- so.melanoma@reductions[["umap"]]@cell.embeddings[ ,1]
+umap.y <- so.melanoma@reductions[["umap"]]@cell.embeddings[ ,2]
+
+plt.ti.ag.umap.mel <- list()
+for (i in 1:length(ti.ag.set)){
+  plt.ti.ag.umap.mel[[names(ti.ag.set)[i]]] <- pseudotime.UMAP(x = umap.x, y = umap.y, pt.size = 1.5,
+                                                           pseudotime = ti.ag.gsva.mel[i ,]) + 
+    labs(title = "Melanoma", subtitle = (firstup(names(ti.ag.set)[i])), color = "Activity") + 
+    scale_colour_distiller(palette ="RdYlGn", direction = -1 ) + 
+    # scale_colour_gradient2("gsva", high = scales::muted("red"), low = scales::muted("blue")) + 
+    theme_miko(legend = if(i==1) F else T)
+}
+
+# merge plots
+plt.ti.ag1.mel <- cowplot::plot_grid(plotlist = plt.ti.ag.umap.mel, rel_widths = c(1,1.2))
+
+bc <- so.melanoma@meta.data[["bc"]]
+u.bc <- unique(bc)
+csub.mod.bc.mel <- matrix(nrow = length(u.bc), ncol = length(ti.ag.set))
+# csub.mod.bc <- t(ti.ag.gsva.mel)
+for (i in 1:length(u.bc)){
+  if (is.na(u.bc[i])) next
+  which.cells <- bc %in% u.bc[i]
+  csub.mod.bc.mel[i,] <- colMeans(t(ti.ag.gsva.mel)[which.cells ,])
+}
+
+colnames(csub.mod.bc.mel) <- names(ti.ag.set)
+rownames(csub.mod.bc.mel) <- u.bc
+
+csub.mod.bc.mel <- csub.mod.bc.mel[complete.cases(csub.mod.bc.mel), ]
+
+
+df.mod.mel <- data.frame(csub.mod.bc.mel)
+df.mod.mel$time <- rownames(df.mod.mel)
+
+# heatmap ######################################################################
+df.col.ann <- data.frame(sample = rownames(csub.mod.bc.mel))
+rownames(df.col.ann) <- rownames(csub.mod.bc.mel)
+
+colors <- c("Ag" = ggthemes::economist_pal()(2)[1], "Ti" = ggthemes::economist_pal()(2)[2])
+df.mod.mel$time <- factor(df.mod.mel$time, levels = c("T0", "phase1", "phase2", "phase3"))
+plt.time.melanoma <- df.mod.mel %>%
+  ggplot() + 
+  geom_point(aes(x = time, y = ag, color = "Ag"), size =2) + 
+  geom_path(aes(x = time, y = ag, group = 1, color = "Ag")) + 
+  geom_point(aes(x = time, y = ti, color = "Ti"), size =2) + 
+  geom_path(aes(x = time, y = ti, group = 1, color = "Ti")) + 
+  xlab("Phase") + 
+  geom_hline(yintercept = 0, linetype = "dashed") + 
+  ylab("Signature Activity") + 
+  theme_miko(legend = T) +
+  labs(title = "Melanoma", subtitle = "Signature Activity Scores", color = "Signature")+
+    scale_color_manual(values = colors)
+
+
+ag.p2 <- df.mod.mel$ag[df.mod.mel$time == "phase2"]
+ag.p3 <- df.mod.mel$ag[df.mod.mel$time == "phase3"]
+ag.dif <- signif(ag.p3-ag.p2, 3)
+
+ti.p2 <- df.mod.mel$ti[df.mod.mel$time == "phase2"]
+ti.p3 <- df.mod.mel$ti[df.mod.mel$time == "phase3"]
+ti.dif <- signif(ti.p3-ti.p2, 3)
+
+df.delta.mel <- data.frame(
+  time = "phase3",
+  delta = c(ag.dif, ti.dif),
+  y = c(0.8*ag.p3, 1.1*ti.p3)
+)
+df.delta.mel$delta <- paste0(df.delta.mel$delta, "")
+plt.time.melanoma <- df.mod.mel %>%
+  dplyr::filter(time %in% c("phase2", "phase3")) %>%
+  ggplot() + 
+  geom_point(aes(x = time, y = ag, color = "Ag"), size =2) + 
+  geom_path(aes(x = time, y = ag, group = 1, color = "Ag")) + 
+  geom_point(aes(x = time, y = ti, color = "Ti"), size =2) + 
+  geom_path(aes(x = time, y = ti, group = 1, color = "Ti")) + 
+  xlab("Phase") + 
+  geom_hline(yintercept = 0, linetype = "dashed") + 
+  ylab("Signature Activity") + 
+  theme_miko(legend = T) +
+  labs(title = "Melanoma", subtitle = "Signature Activity Scores", color = "Signature")+
+  geom_text(data = df.delta.mel, aes(x = time, y= y, label = delta), size = 3) + 
+    scale_color_manual(values = colors)
+
+plt.time.melanoma
+
+
+
+
+```
+
+```{r ag and ti progression mrd}
+
+df.mod.mel2 <- df.mod.mel %>% dplyr::filter(time %in% c("phase2", "phase3"))
+df.mod.mel2$sample <- df.mod.mel2$condition <- df.mod.mel2$time
+df.mod.mel2$sample <- "Melanoma_Rambow2018"
+df.mod.mel2$condition <- as.character(df.mod.mel2$condition)
+df.mod.mel2$condition[df.mod.mel2$time == "phase2"] <- "Ctrl"
+df.mod.mel2$condition[df.mod.mel2$time == "phase3"] <- "TR"
+
+df.mod.gbm2 <- df.mod.gbm
+df.mod.gbm2$sample <- paste0("GBM_",df.mod.gbm2$sample)
+df.mod.gbm.mel <- bind_rows(df.mod.gbm2, df.mod.mel2)
+
+ plt.ag.prog <- df.mod.gbm.mel %>%
+  ggplot() +
+  geom_point(aes(x = condition, y = ag, color = sample), size =4) + 
+  geom_path(aes(x = condition, y = ag, group = sample, color = sample)) + 
+  xlab("Phase") + 
+  ylab("Signature Activity") + 
+  theme_miko(legend = T, color.palette = "ptol") +
+  labs(title = "Ag Score Progression", subtitle = "Signature Activity Scores", color = "Sample") 
+
+ plt.ti.prog <- df.mod.gbm.mel %>%
+  ggplot() +
+  geom_point(aes(x = condition, y = ti, color = sample), size =4) + 
+  geom_path(aes(x = condition, y = ti, group = sample, color = sample)) + 
+  xlab("Phase") + 
+  ylab("Signature Activity") + 
+  theme_miko(legend = T, color.palette = "ptol") +
+  labs(title = "Ti Score Progression", subtitle = "Signature Activity Scores", color = "Sample") 
+ 
+ plt.ag.prog
+ plt.ti.prog
+
+```
+
+```{r compare GBM and Melanoma, fig.height = 5.5, fig.width=10}
+
+cowplot::plot_grid(
+  cowplot::plot_grid(plt.ti.ag1, plt.time.gbm, ncol = 2, rel_widths = c(1.3,1)), 
+  cowplot::plot_grid(plt.ti.ag1.mel, plt.time.melanoma, ncol = 2, rel_widths = c(1.3,1)),
+  ncol = 1)
+
+```
+
+
+
+```{r}
+
+gseaNetwork <- function(gsea.data, plot.title, flag.genes){
+df.list<- list()
+for (i in 1:nrow(gsea.data)){
+  path.name <- gsea.data$pathway[i]
+  cur.set <- unlist(strsplit(unlist(gsea.data$set[i]), ","))
+  cur.set <- unique(gsub(" ", "", cur.set))
+  df.list[[path.name]] <- cur.set
+}
+
+j.mat <- jaccardSimilarityMatrix(df.list, assert.unique = T)
+
+so.gsea <- CreateSeuratObject(counts = j.mat)
+so.gsea <- ScaleData(so.gsea,  do.scale = F, do.center = F)
+so.gsea <- FindVariableFeatures(so.gsea)
+so.gsea <- RunPCA(so.gsea)
+pca.var.threshold <- 0.98
+pca.prop <- propVarPCA(so.gsea)
+nDim <- max(pca.prop$pc.id[pca.prop$pc.cum_sum<pca.var.threshold])+1
+
+so.gsea <- FindNeighbors(so.gsea, k.param = 20)
+so.gsea <- FindClusters(so.gsea)
+so.gsea <- RunUMAP(so.gsea, dims = 1:nDim, n.neighbors = 20, spread = 10)
+
+plt.net <- connectUMAP(j.mat, so.gsea, gsea.data, plot.title, flag.genes)
+
+return(plt.net)
+
+}
+
+
+```
+
+
+```{r}
+
+
+
+# genes for annotation #########################################################
+# HH.gene.path <- "C:/Users/Owner/Documents/scPipeline/M09_type1_queries.csv"
+# df.hh.gene <- read.csv(HH.gene.path)[ ,"NeuList_HH201112"]
+# df.hh.gene <- df.hh.gene[df.hh.gene %in% id2tx[colnames(so.gene)]]
+
+connectUMAP <- function(mat, object, df.dat, title.name, flag.genes ){
+
+# get connectivity #############################################################
+snn.graph <- mat
+df.connectivity <- getConnectivity(snn.graph, rownames(snn.graph))
+
+graph.threshold <- quantile(snn.graph[snn.graph > 0], 0.1)
+df.graph.edges <- NULL
+for (i in 1:ncol(snn.graph)){
+  cur.graph <- snn.graph[ ,i]
+  cur.graph <- cur.graph[cur.graph>=graph.threshold ]
+
+  if (length(cur.graph) == 0) next
+
+  df.graph.edges <- bind_rows(df.graph.edges, data.frame(
+    start = colnames(snn.graph)[i],
+    end = names(cur.graph),
+    weights = cur.graph
+  ))
+
+}
+
+# wnnUMAP.list <- getUMAP(so.gene, umap.key = "wnn.umap", node.type = "text")
+df.umap.jj <- data.frame(
+  x = object@reductions[["umap"]]@cell.embeddings[,1],
+  y = object@reductions[["umap"]]@cell.embeddings[,2],
+  pathway =  rownames(object),
+  pval = -log10(df.dat$pval),
+  nes = df.dat$NES,
+  cluster = object$seurat_clusters
+)
+df.wnn.umap <- df.umap.jj
+df.wnn.umap.x <- df.wnn.umap
+colnames(df.wnn.umap.x) <- c("x.start", "y.start", "start", "cluster")
+df.wnn.umap.y <- df.wnn.umap
+colnames(df.wnn.umap.y) <- c("x.end", "y.end", "end", "cluster")
+df.ux <- merge(df.graph.edges, df.wnn.umap.x, by = "start")
+df.uy <- merge(df.graph.edges, df.wnn.umap.y, by = "end")
+df.umap.merge <- merge(df.ux, df.uy, by = c("start", "end"))
+
+df.wnn.umap$genes <- df.wnn.umap$pathway
+df.wnn.umap <- merge(df.wnn.umap, df.connectivity, by = "genes")
+
+
+
+df.wnn.umap$do.label <- ""
+df.wnn.umap$do.label[df.wnn.umap$pathway %in% flag.genes] <- df.wnn.umap$pathway[df.wnn.umap$pathway %in% flag.genes]
+
+df.wnn.umap$do.label <- stringr::str_trunc(df.wnn.umap$do.label, 30)
+
+df.wnn.umap$do.color <- "grey"
+
+if (grepl("Ag", title.name)){
+  df.wnn.umap$do.color[df.wnn.umap$pathway %in% flag.genes] <- ggthemes::ptol_pal()(2)[2]
+} else if (grepl("Ti", title.name)) {
+  df.wnn.umap$do.color[df.wnn.umap$pathway %in% flag.genes] <- ggthemes::ptol_pal()(2)[1]
+} else {
+   df.wnn.umap$do.color[df.wnn.umap$pathway %in% flag.genes] <- "red"
+}
+
+
+plt.wnn.umap.connectivity.net <- df.wnn.umap %>%
+  ggplot(aes(x = x, y = y)) + 
+  geom_segment(data = df.umap.merge, aes(x = x.start, y = y.start,
+                                         xend = x.end, yend= y.end,
+                                        ), color = "black", alpha = 0.015) +   #alpha = weights.x , alpha = 0.8
+  geom_point(aes( size = pval), fill = df.wnn.umap$do.color, shape = 21, color = "grey", alpha = 0.8) + 
+  scale_size_continuous(range = c(1, 5)) +
+
+  theme_miko(legend = T, center.title = T) +
+    theme(
+    panel.border = element_blank(),
+    axis.text = element_blank(),
+    panel.grid = element_blank(),
+    axis.ticks = element_blank()
+  ) +
+  guides(fill = guide_legend(override.aes = list(size=5))) + 
+  xlab("") + ylab("") +
+  scale_fill_gradient2(low = scales::muted("blue"), high = scales::muted("red")) +
+  labs(size = "-log(p)", alpha = "Weight", title = title.name) + 
+  ggrepel::geom_text_repel(aes(label = do.label), size = 2) + 
+  theme(legend.position = "bottom")
+
+return(plt.wnn.umap.connectivity.net)
+  
+}
+
+
+```
+
+
+```{r, fig.width=10, fig.height=5}
+
+
+gbm.ag.path <- getPathwayAssociation(object = so.query, values = c.auc$data$ag, min.pct = 0.15, subsample = 1, cor.method = "spearman", 
+                                    species = "Hs", pathway.db = "GO", show.n.pathways = 10, pathway.name.trunc = 50)
+
+gbm.ti.path <- getPathwayAssociation(object = so.query, values = c.auc$data$ti, min.pct = 0.15, subsample = 1, cor.method = "spearman", 
+                                    species = "Hs", pathway.db = "GO", show.n.pathways =  10, pathway.name.trunc = 50)
+
+v.mel.auc <- runMS(object = so.melanoma, genelist = verhaak.list, size = 0.75)
+g.mel.auc <- runMS(object = so.melanoma, genelist = gsc.list, size = 0.75)
+n.mel.auc <- runMS(object = so.melanoma, genelist = neftel.list, size = 0.75)
+c.mel.auc <- runMS(object = so.melanoma, genelist = ti.ag.set, size = 0.75)
+
+mel.ag.path <- getPathwayAssociation(object = so.melanoma, values = c.mel.auc$data$ag, min.pct = 0.15, subsample = 1, cor.method = "spearman", 
+                                    species = "Hs", pathway.db = "GO", show.n.pathways = 10, pathway.name.trunc = 50)
+
+mel.ti.path <- getPathwayAssociation(object = so.melanoma, values = c.mel.auc$data$ti, min.pct = 0.15, subsample = 1, cor.method = "spearman", 
+                                    species = "Hs", pathway.db = "GO", show.n.pathways = 10, pathway.name.trunc = 50)
+
+mel.ag.path$plot
+mel.ti.path$plot
+
+
+# AG specific network ##########################################################
+fdr.thresh <- 0.005
+
+path.gbm.ag <- (gbm.ag.path$gsea %>% dplyr::filter(pval < fdr.thresh, NES > 0))$pathway
+path.rich.ag <- (richards.gsc.ag.path$gsea %>% dplyr::filter(pval < fdr.thresh, NES > 0))$pathway
+path.neft.ag <- (neftel.10x.ag.path$gsea %>% dplyr::filter(pval < fdr.thresh, NES > 0))$pathway
+path.mel.ag <- (mel.ag.path$gsea %>% dplyr::filter(pval < fdr.thresh, NES > 0))$pathway
+df.path.common.ag <- data.frame(table(c(path.neft.ag, path.rich.ag, path.gbm.ag, path.mel.ag)))
+
+
+plt.net.gbm.ag <- gseaNetwork(gsea.data = (gbm.ag.path$gsea %>% dplyr::filter(pval < fdr.thresh)), 
+                              plot.title = "GBM, Ag", 
+                              flag.genes = df.path.common.ag$Var1[df.path.common.ag$Freq == max(df.path.common.ag$Freq)])
+plt.net.richards.ag <- gseaNetwork(gsea.data = (richards.gsc.ag.path$gsea %>% dplyr::filter(pval < fdr.thresh)), 
+                                   plot.title = "Richards, Ag",
+                                   flag.genes = df.path.common.ag$Var1[df.path.common.ag$Freq == max(df.path.common.ag$Freq)])
+plt.net.neftel.ag <- gseaNetwork(gsea.data = (neftel.10x.ag.path$gsea %>% dplyr::filter(pval < fdr.thresh)), 
+                                   plot.title = "Neftel, Ag",
+                                   flag.genes = df.path.common.ag$Var1[df.path.common.ag$Freq == max(df.path.common.ag$Freq)])
+plt.net.mel.ag <- gseaNetwork(gsea.data = (mel.ag.path$gsea %>% dplyr::filter(pval < fdr.thresh)), 
+                                   plot.title = "Melanoma, Ag",
+                                   flag.genes = df.path.common.ag$Var1[df.path.common.ag$Freq == max(df.path.common.ag$Freq)])
+
+
+# TI specific network ##########################################################
+fdr.thresh <- 0.01
+
+path.gbm.ti <- (gbm.ti.path$gsea %>% dplyr::filter(pval < fdr.thresh, NES > 0))$pathway
+path.rich.ti <- (richards.gsc.ti.path$gsea %>% dplyr::filter(pval < fdr.thresh, NES > 0))$pathway
+path.neft.ti <- (neftel.10x.ti.path$gsea %>% dplyr::filter(pval < fdr.thresh, NES > 0))$pathway
+path.mel.ti <- (mel.ti.path$gsea %>% dplyr::filter(pval < fdr.thresh, NES > 0))$pathway
+df.path.common.ti <- data.frame(table(c(path.gbm.ti, path.rich.ti, path.neft.ti, path.mel.ti)))
+
+
+plt.net.gbm.ti <- gseaNetwork(gsea.data = (gbm.ti.path$gsea %>% dplyr::filter(pval < fdr.thresh, NES > 0)), 
+                              plot.title = "GBM, Ti", 
+                              flag.genes = df.path.common.ti$Var1[df.path.common.ti$Freq == max(df.path.common.ti$Freq)])
+plt.net.richards.ti <- gseaNetwork(gsea.data = (richards.gsc.ti.path$gsea %>% dplyr::filter(pval < fdr.thresh, NES > 0)), 
+                                   plot.title = "Richards, Ti",
+                                   flag.genes = df.path.common.ti$Var1[df.path.common.ti$Freq == max(df.path.common.ti$Freq)])
+plt.net.neftel.ti <- gseaNetwork(gsea.data = (neftel.10x.ti.path$gsea %>% dplyr::filter(pval < fdr.thresh, NES > 0)), 
+                                   plot.title = "Neftel, Ti",
+                                   flag.genes = df.path.common.ti$Var1[df.path.common.ti$Freq == max(df.path.common.ti$Freq)])
+plt.net.mel.ti <- gseaNetwork(gsea.data = (mel.ti.path$gsea %>% dplyr::filter(pval < fdr.thresh, NES > 0)), 
+                                   plot.title = "Melanoma, Ti",
+                                   flag.genes = df.path.common.ti$Var1[df.path.common.ti$Freq == max(df.path.common.ti$Freq)])
+
+
+# plt.net.gbm.ti
+
+```
+
+
+
+
+
+```{r, fig.width=16, fig.height=10}
+
+
+
+plt.networks <- cowplot::plot_grid(
+  cowplot::plot_grid(plt.net.gbm.ag, plt.net.richards.ag, plt.net.neftel.ag, plt.net.mel.ag, nrow = 1),
+  cowplot::plot_grid(plt.net.gbm.ti, plt.net.richards.ti, plt.net.neftel.ti, plt.net.mel.ti, nrow = 1),
+  nrow = 2
+)
+
+plt.networks
+# savePDF("ag_ti_enrichment_network_plot.pdf", plt.networks, fig.width=16, fig.height=10)
+
+```
+
+
+
+```{r public data pathway associations}
+
+
+# a <- mel.ag.path$gsea
+
+
+
+
+df.c5 <- c.mel.auc$data
+
+df.c5.cor <- data.frame(
+  Developmental_Richards2021 = g.mel.auc$data$Developmental,
+  Injury_Response_Richards2021 = g.mel.auc$data$Injury_Response,
+  Classical_Verhaak2010 = v.mel.auc$data$Classical,
+  Proneural_Verhaak2010 = v.mel.auc$data$Proneural,
+  Neural_Verhaak2010 = v.mel.auc$data$Neural,
+  Mesenchymal_Verhaak2010 = v.mel.auc$data$Mesenchymal,
+  MES1_Neftel2019 = n.mel.auc$data$MES1,
+  MES2_Neftel2019 = n.mel.auc$data$MES2,
+  NPC1_Neftel2019 = n.mel.auc$data$NPC1,
+  NPC2_Neftel2019 = n.mel.auc$data$NPC2,
+  AC_Neftel2019 = n.mel.auc$data$AC,
+  OPC_Neftel2019 = n.mel.auc$data$OPC,
+  ag = c.mel.auc$data$ag,
+  ti = c.mel.auc$data$ti
+)
+
+
+p5.ti.ag <- df.c5 %>%
+  ggplot(aes(x = get(which.x), y = get(which.y))) +
+  geom_point() + geom_smooth(method = "lm", se= F, color = "tomato") + ylab("Ti signature") + xlab("Ag signature") + 
+  labs(title = "Rambow (2018): Melanoma", 
+       subtitle = paste0("rho = ", signif(cor(df.c5$ag,df.c5$ti), 2))) + theme_miko()
+
+el.size <- 8
+gsea.plot.theme <- theme(axis.text.y = element_text(size = el.size),
+                         axis.text.x = element_text(size = el.size),
+                          plot.title = element_text(size = 8),
+                         plot.caption = element_text(size = el.size),
+                         axis.title.y = element_text(size = el.size),
+                         axis.title.x = element_text(size = el.size),
+                         legend.position = "none") 
+
+
+plt.gbm <- cowplot::plot_grid(gbm.ag.path$plot + labs(title = "Ag signature")  + gsea.plot.theme,
+                              gbm.ti.path$plot + labs(title = "Ti signature")  +gsea.plot.theme, ncol = 1)
+
+plt.mel <- cowplot::plot_grid(mel.ag.path$plot + labs(title = "Ag signature")  + gsea.plot.theme,
+                              mel.ti.path$plot + labs(title = "Ti signature")  + gsea.plot.theme, ncol = 1)
+
+plt.neftel.10x <- cowplot::plot_grid(neftel.10x.ag.path$plot + labs(title = "Ag signature")  +gsea.plot.theme,
+                              neftel.10x.ti.path$plot + labs(title = "Ti signature")  + gsea.plot.theme, ncol = 1)
+
+plt.richards.gsc <- cowplot::plot_grid(richards.gsc.ag.path$plot + labs(title = "Ag signature")  + gsea.plot.theme,
+                              richards.gsc.ti.path$plot + labs(title = "Ti signature")  + gsea.plot.theme, ncol = 1)
+
+
+
+
+```
+
+```{r signature correlations - public db}
+
+c5.cor.mat <- cor(df.c5.cor, method = "spearman") # melanoma
+c4.cor.mat <- cor(df.c4.cor, method = "spearman") # Richards
+c3.cor.mat <- cor(df.c3.cor, method = "spearman") # Current Study
+c1.cor.mat <- cor(df.c1.cor, method = "spearman") # Neftel
+
+
+my.breaks <- seq(-1, 1, by = 2/99)
+
+plt.c5.hm <- ggplotify::as.ggplot(pheatmap::pheatmap(c5.cor.mat,show_colnames = F, border_color = NA, cutree_cols = 3,cutree_rows = 3,
+                                                     breaks = my.breaks, silent = T,
+                                                     color = colorRampPalette(rev(brewer.pal(n = 100, name = "RdBu")))(100))) + labs(title = "Melanoma (Rambow 2018)")
+plt.c4.hm <- ggplotify::as.ggplot(pheatmap::pheatmap(c4.cor.mat,show_colnames = F, border_color = NA, cutree_cols = 3,cutree_rows = 3,
+                                                     breaks = my.breaks, silent = T,
+                                                     color = colorRampPalette(rev(brewer.pal(n = 100, name = "RdBu")))(100))) + labs(title = "GSC (Richards 2021)")
+plt.c1.hm <- ggplotify::as.ggplot(pheatmap::pheatmap(c1.cor.mat,show_colnames = F, border_color = NA, cutree_cols = 3,cutree_rows = 3,
+                                                     breaks = my.breaks, silent = T,
+                                                     color = colorRampPalette(rev(brewer.pal(n = 100, name = "RdBu")))(100))) + labs(title = "GBM (Neftel 2019)")
+plt.c3.hm <- ggplotify::as.ggplot(pheatmap::pheatmap(c3.cor.mat,show_colnames = F, border_color = NA, cutree_cols = 3,cutree_rows = 3,
+                                                     breaks = my.breaks, silent = T,
+                                                     color = colorRampPalette(rev(brewer.pal(n = 100, name = "RdBu")))(100)))  + labs(title = "GBM (current study)")
+
+plt.c5.hm
+
+plt.c4.hm
+
+plt.c1.hm
+
+plt.c3.hm
+
+
+
+
+
+```
+```{r, fig.width=23, fig.height=5}
+
+plt.signature.sim <- cowplot::plot_grid(plt.c3.hm, plt.c1.hm, plt.c4.hm, nrow = 1)
+plt.signature.sim
+# savePDF("Fig4_sup2D_signature_similarity_profiles_010721.pdf", plt.signature.sim, fig.width=20, fig.height=5)
+```
+
+
+```{r, fig.height=14, fig.width=8}
+
+# Ag Correlations ##############################################################
+
+gbm.cor.ag <- data.frame(gene = rownames(gbm.ag.path$cor), GBM_current2021 = gbm.ag.path$cor[,1])
+ric.cor.ag <- data.frame(gene = rownames(richards.gsc.ag.path$cor), GSC_Richards2021 = richards.gsc.ag.path$cor[,1])
+nef.cor.ag <- data.frame(gene = rownames(neftel.10x.ag.path$cor), GBM_Neftel2019 = neftel.10x.ag.path$cor[,1])
+mel.cor.ag <- data.frame(gene = rownames(mel.ag.path$cor), Melanoma_Rambow2018 = mel.ag.path$cor[,1])
+
+df.cor.ag <- merge(merge(merge(gbm.cor.ag,ric.cor.ag,by = "gene", all.x = T),
+                         nef.cor.ag, by = "gene", all.x = T), 
+                   mel.cor.ag, by = "gene", all.x = T)
+
+gene.all <- df.cor.ag$gene
+df.cor.ag <- col2rowname(df.cor.ag, "gene")
+df.cor.ag$gene <- gene.all
+
+df.cor.ag.top <- unique(bind_rows(df.cor.ag %>% dplyr::top_n(40, GBM_current2021), 
+                                  df.cor.ag %>% dplyr::top_n(40, (-GBM_current2021))))
+
+df.cor.ag.ti <- df.cor.ag[df.cor.ag$gene %in% unlist(ti.ag.set), ]
+df.cor.ag.top <- unique(bind_rows(df.cor.ag.top, df.cor.ag.ti))
+
+df.cor.ag.top <- col2rowname(df.cor.ag.top, "gene")
+my.breaks <- seq(-1, 1, by = 0.01)
+df.ag.ti.ann <- data.frame(
+  gene = rownames(df.cor.ag.top),
+  set = "other"
+)
+
+df.ag.ti.ann$set[df.ag.ti.ann$gene %in% ti.ag.set$ag] <- "ag"
+df.ag.ti.ann$set[df.ag.ti.ann$gene %in% ti.ag.set$ti] <- "ti"
+df.ag.ti.ann <- col2rowname(df.ag.ti.ann, "gene")
+
+
+ag.set.col = list(
+    set = c(ag = ggthemes::ptol_pal()(2)[2], ti = ggthemes::ptol_pal()(2)[1], other = "grey")
+)
+
+plt.top.ag.cor <- ggplotify::as.ggplot(pheatmap::pheatmap(df.cor.ag.top, 
+                                                       border_color = NA,
+                                                       annotation_row = df.ag.ti.ann,
+                                                       annotation_colors = ag.set.col,
+                                                       cutree_cols = 2,
+                                                       cutree_rows = 2,
+                                                       breaks = my.breaks,
+                                                       colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(length(my.breaks))))
+
+plt.top.ag.cor <- plt.top.ag.cor + labs(title = "Ag Signature Correlations") + theme(plot.title = element_text(hjust = 0.5))
+
+
+# Ti Correlations ##############################################################
+
+gbm.cor.ti <- data.frame(gene = rownames(gbm.ti.path$cor), GBM_current2021 = gbm.ti.path$cor[,1])
+ric.cor.ti <- data.frame(gene = rownames(richards.gsc.ti.path$cor), GSC_Richards2021 = richards.gsc.ti.path$cor[,1])
+nef.cor.ti <- data.frame(gene = rownames(neftel.10x.ti.path$cor), GBM_Neftel2019 = neftel.10x.ti.path$cor[,1])
+mel.cor.ti <- data.frame(gene = rownames(mel.ti.path$cor), Melanoma_Rambow2018 = mel.ti.path$cor[,1])
+
+df.cor.ti <- merge(merge(merge(gbm.cor.ti,ric.cor.ti,by = "gene", all.x = T),
+                         nef.cor.ti, by = "gene", all.x = T), 
+                   mel.cor.ti, by = "gene", all.x = T)
+
+
+gene.all <- df.cor.ti$gene
+
+df.cor.ti <- col2rowname(df.cor.ti, "gene")
+
+df.cor.ti$gene <- gene.all
+
+df.cor.ti.top <- unique(bind_rows(df.cor.ti %>% dplyr::top_n(40, (GBM_current2021)), 
+                                  df.cor.ti %>% dplyr::top_n(40, (-GBM_current2021))))
+
+df.cor.ag.ti <- df.cor.ti[df.cor.ti$gene %in% unlist(ti.ag.set), ]
+df.cor.ti.top <- unique(bind_rows(df.cor.ti.top, df.cor.ag.ti))
+
+# df.cor.ti.top <- df.cor.ti.top %>% dplyr::select(-c("r"))
+
+df.cor.ti.top <- col2rowname(df.cor.ti.top, "gene")
+my.breaks <- seq(-1, 1, by = 0.01)
+df.ag.ti.ann <- data.frame(
+  gene = rownames(df.cor.ti.top),
+  set = "other"
+)
+
+df.ag.ti.ann$set[df.ag.ti.ann$gene %in% ti.ag.set$ag] <- "ag"
+df.ag.ti.ann$set[df.ag.ti.ann$gene %in% ti.ag.set$ti] <- "ti"
+df.ag.ti.ann <- col2rowname(df.ag.ti.ann, "gene")
+
+ti.set.col = list(
+    set = c(ag = ggthemes::ptol_pal()(2)[2], ti = ggthemes::ptol_pal()(2)[1], other = "grey")
+)
+
+plt.top.ti.cor <- ggplotify::as.ggplot(pheatmap::pheatmap(df.cor.ti.top, 
+                                                       border_color = NA,
+                                                       annotation_row = df.ag.ti.ann,
+                                                       annotation_colors = ti.set.col,
+                                                       cutree_cols = 2,
+                                                       cutree_rows = 2,
+                                                       breaks = my.breaks,
+                                                       colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(length(my.breaks))))
+
+plt.top.ti.cor <- plt.top.ti.cor + labs(title = "Ti Signature Correlations", caption = "x = sample; y = gene; z = signature correlation") + theme(plot.title = element_text(hjust = 0.5))
+
+plt.gene.cor.sig <- cowplot::plot_grid(plt.top.ag.cor, plt.top.ti.cor, ncol = 2, labels = c("A", "B"))
+
+
+
+```
+
+
+```{r fig.height=16, fig.width=22}
+
+
+plt.c5.hm <- ggplotify::as.ggplot(pheatmap::pheatmap(c5.cor.mat,show_colnames = F, border_color = NA, cutree_cols = 3,cutree_rows = 3,
+                                                     breaks = my.breaks,
+                                                     color = colorRampPalette(rev(brewer.pal(n = 100, name = "RdYlGn")))(100)))
+plt.c4.hm <- ggplotify::as.ggplot(pheatmap::pheatmap(c4.cor.mat,show_colnames = F, border_color = NA, cutree_cols = 3,cutree_rows = 3,
+                                                     breaks = my.breaks,
+                                                     color = colorRampPalette(rev(brewer.pal(n = 100, name = "RdYlGn")))(100)))
+plt.c1.hm <- ggplotify::as.ggplot(pheatmap::pheatmap(c1.cor.mat,show_colnames = F, border_color = NA, cutree_cols = 4,cutree_rows = 4,
+                                                     breaks = my.breaks,
+                                                     color = colorRampPalette(rev(brewer.pal(n = 100, name = "RdYlGn")))(100)))
+plt.c3.hm <- ggplotify::as.ggplot(pheatmap::pheatmap(c3.cor.mat,show_colnames = F, border_color = NA, cutree_cols = 3,cutree_rows = 3,
+                                                     breaks = my.breaks,
+                                                     color = colorRampPalette(rev(brewer.pal(n = 100, name = "RdYlGn")))(100)))
+
+
+plt.c5.hm <- plt.c5.hm + labs(title = "Melanoma (Rambdow 2018)", subtitle = "Signature Correlations") + theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5))
+
+plt.c4.hm <- plt.c4.hm + labs(title = "GSC (Richards 2021)", subtitle = "Signature Correlations") + theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5))
+
+plt.c1.hm <- plt.c1.hm + labs(title = "GBM (Neftel 2019)", subtitle = "Signature Correlations") + theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5))
+
+plt.c3.hm <- plt.c3.hm + labs(title = "GBM (Current 2021)", subtitle = "Signature Correlations") + theme(plot.title = element_text(hjust = 0.5), plot.subtitle = element_text(hjust = 0.5))
+
+
+plt.sig.cor <- cowplot::plot_grid(
+  plt.gene.cor.sig,
+  cowplot::plot_grid(NULL, NULL, plt.c3.hm, plt.c1.hm, NULL, NULL, plt.c4.hm, plt.c5.hm, NULL, NULL, ncol = 2, rel_heights = c(1,4,1,4,2), labels = c("", "","C", "D","", "",  "E", "F")),
+  ncol = 2,rel_widths = c(1.2,2), align = "h"
+)
+
+
+
+# savePDF("signature_correlations_120221.pdf", plt.sig.cor, fig.height=16, fig.width=22)
+# plt.c5.hm
+
+```
+
+
+
+```{r construct pathway plots, fig.width=14, fig.height=5}
+
+# plt.mel
+
+# p3.ti.ag
+# cowplot::plot_grid(
+supp1.gbm <-cowplot::plot_grid(plt.gbm,p3.ti.ag, cowplot::plot_grid(NULL, plt.c3.hm, NULL, ncol = 1, rel_heights = c(1,7,1)), nrow = 1, rel_widths = c(1,1,1.5))
+                               # , rel_widths = c(1,2), nrow = 1, align = "h", axis = "b")
+
+
+supp1.mel <-cowplot::plot_grid(plt.mel,p5.ti.ag, cowplot::plot_grid(NULL, plt.c5.hm, NULL, ncol = 1, rel_heights = c(1,7,1)), nrow = 1, rel_widths = c(1,1,1.5))
+
+
+supp1.neftel.10x <-cowplot::plot_grid(plt.neftel.10x,p1.ti.ag, cowplot::plot_grid(NULL, plt.c1.hm, NULL, ncol = 1, rel_heights = c(1,7,1)), nrow = 1, rel_widths = c(1,1,1.5))
+
+
+supp1.richards.gsc <-cowplot::plot_grid(plt.richards.gsc,p4.ti.ag, cowplot::plot_grid(NULL, plt.c4.hm, NULL, ncol = 1, rel_heights = c(1,7,1)), nrow = 1, rel_widths = c(1,1,1.5))
+
+supp1.gbm
+supp1.mel
+supp1.neftel.10x
+supp1.richards.gsc
+
+
+
+```
+
+```{r signature association plots, fig.width=14, fig.height=20}
+cowplot::plot_grid(supp1.gbm, supp1.mel, supp1.neftel.10x, supp1.richards.gsc, ncol = 1, labels = "AUTO")
+```
+
+
+```{r GO enrich final list}
+
+# run enrichment ###############################################################
+go.enrich <- runHG(ti.ag.set, gene.universe = rownames(so.query), pathway.db = "GO", species = "Hs")
+go.enrich.sum <- summarizeHG(go.enrich)
+go.enrich.sum$plots
+
+go.enrich[["ag"]]$module <- "Ag"
+go.enrich[["ti"]]$module <- "Ti"
+
+enrich.results <- bind_rows(go.enrich)
+
+# extract and wrangle tables ###################################################
+# enrich.results <- go.enrich[["results.table.p"]]
+enrich.results.top <- enrich.results %>%
+  group_by(module) %>%
+  mutate(logp = -log10(padj)) %>%
+  top_n(5, logp) %>%
+  arrange(-logp)
+ enrich.results.top$Term2 <- stringr::str_trunc(enrich.results.top$pathway, 45)
+
+# generate ranked plot of top terms ############################################
+plt.top.go <- enrich.results.top %>%
+  group_by(module) %>%
+  ggplot(aes(x = reorder(Term2, c(logp)), y = logp, fill = module)) +
+  geom_bar(stat = "identity", alpha = 0.8) +
+  coord_flip() +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed") +
+  # ggthemes::scale_() +
+  theme_miko(legend = T, fill.palette = "ptol") +
+  xlab("GO Term") +
+  ylab("-log10(p)") +
+  labs(title = "Signature GO", caption = "dashed line = 5% FDR")
+
+ # visualize
+# plt.top.go
+
+```
+
+```{r ag ti enrich final list, fig.height=9,fig.width=10}
+
+# AG ###########################################################################
+# run enrichment ###############################################################
+go.enrich.ag.bp <- runHG(list(ag = ti.ag.set$ag), gene.universe = rownames(so.query), pathway.db = "GO", species = "Hs", go.ontology = "BP")
+go.enrich.ag.cc <- runHG(list(ag = ti.ag.set$ag), gene.universe = rownames(so.query), pathway.db = "GO", species = "Hs", go.ontology = "CC")
+go.enrich.ag.mf <- runHG(list(ag = ti.ag.set$ag), gene.universe = rownames(so.query), pathway.db = "GO", species = "Hs", go.ontology = "MF")
+
+go.enrich.ag.bp.sum <- summarizeHG(go.enrich.ag.bp)
+go.enrich.ag.cc.sum <- summarizeHG(go.enrich.ag.cc)
+go.enrich.ag.mf.sum <- summarizeHG(go.enrich.ag.mf)
+
+# go.enrich.ag.bp <- runHG(list(ag =c("PSMB6", "PSMA4", "PSMB8")), gene.universe = rownames(so.query), pathway.db = "GO", species = "Hs", go.ontology = "BP")
+# go.enrich.ag.cc <- runHG(list(ag =c("PSMB6", "PSMA4", "PSMB8")), gene.universe = rownames(so.query), pathway.db = "GO", species = "Hs", go.ontology = "CC")
+# go.enrich.ag.mf <- runHG(list(ag = c("PSMB6", "PSMA4", "PSMB8")), gene.universe = rownames(so.query), pathway.db = "GO", species = "Hs", go.ontology = "MF")
+
+
+
+# ag.go.bp <-go.enrich.bp$ag
+ag.go.bp <-(go.enrich.ag.bp$ag %>% dplyr::arrange(padj))[1:5,] %>% na.omit
+ag.go.cc <-(go.enrich.ag.cc$ag %>% dplyr::arrange(padj))[1:5,] %>% na.omit
+ag.go.mf <-(go.enrich.ag.mf$ag %>% dplyr::arrange(padj))[1:5,] %>% na.omit
+
+plt.ag.go.bp <- go.enrich.ag.bp.sum$plots$ag + 
+  # ggplot(aes(y = reorder(stringr::str_wrap(pathway,25), overlap), x = overlap, fill = -log10(padj))) +
+  # geom_bar(stat = "identity", alpha = 0.8, color = "black") +
+  theme_miko(legend = T, center.title = T) +
+  scale_fill_gradient(high = ggthemes::ptol_pal()(2)[2], low = "white") + 
+  ylab("") +
+  xlab("Geneset Overlap (N)") +
+  labs(title = "GO Biological Process", subtitle = "Ag Signature", caption = paste0(length(ti.ag.set$ag), " genes"))
+
+plt.ag.go.cc <- go.enrich.ag.cc.sum$plots$ag + 
+  # ggplot(aes(y = reorder(stringr::str_wrap(pathway,25), overlap), x = overlap, fill = -log10(padj))) +
+  # geom_bar(stat = "identity", alpha = 0.8, color = "black") +
+  theme_miko(legend = T, center.title = T) +
+  scale_fill_gradient(high = ggthemes::ptol_pal()(2)[2], low = "white") + 
+  ylab("") +
+  xlab("Geneset Overlap (N)") +
+  labs(title = "GO Cellular Compartment", subtitle = "Ag Signature", caption = paste0(length(ti.ag.set$ag), " genes"))
+
+plt.ag.go.mf <- go.enrich.ag.mf.sum$plots$ag + 
+  # ggplot(aes(y = reorder(stringr::str_wrap(pathway,25), overlap), x = overlap, fill = -log10(padj))) +
+  # geom_bar(stat = "identity", alpha = 0.8, color = "black") +
+  theme_miko(legend = T, center.title = T) +
+  scale_fill_gradient(high = ggthemes::ptol_pal()(2)[2], low = "white") + 
+  ylab("") +
+  xlab("Geneset Overlap (N)") +
+  labs(title = "GO Molecular Function", subtitle = "Ag Signature", caption = paste0(length(ti.ag.set$ag), " genes"))
+
+
+
+# TI ###########################################################################
+# run enrichment ###############################################################
+go.enrich.ti.bp <- runHG(list(ti = ti.ag.set$ti), gene.universe = rownames(so.query), pathway.db = "GO", species = "Hs", go.ontology = "BP")
+go.enrich.ti.cc <- runHG(list(ti = ti.ag.set$ti), gene.universe = rownames(so.query), pathway.db = "GO", species = "Hs", go.ontology = "CC")
+go.enrich.ti.mf <- runHG(list(ti = ti.ag.set$ti), gene.universe = rownames(so.query), pathway.db = "GO", species = "Hs", go.ontology = "MF")
+
+go.enrich.ti.bp.sum <- summarizeHG(go.enrich.ti.bp)
+go.enrich.ti.cc.sum <- summarizeHG(go.enrich.ti.cc)
+go.enrich.ti.mf.sum <- summarizeHG(go.enrich.ti.mf)
+# go.enrich.ti.bp.sum$plots
+
+# dplyr::filter(padj < 0.05) %>% 
+ti.go.bp <-(go.enrich.ti.bp$ti %>% dplyr::arrange(padj))[1:5,] %>% na.omit
+ti.go.cc <-(go.enrich.ti.cc$ti %>%  dplyr::arrange(padj))[1:5,] %>% na.omit
+ti.go.mf <-(go.enrich.ti.mf$ti %>% dplyr::arrange(padj))[1:5,] %>% na.omit
+
+plt.ti.go.bp <- go.enrich.ti.bp.sum$plots$ti + 
+  # ggplot(aes(y = reorder(stringr::str_wrap(pathway,25), overlap), x = overlap, fill = -log10(padj))) +
+  # geom_bar(stat = "identity", alpha = 0.8, color = "black") +
+  theme_miko(legend = T, center.title = T) +
+  scale_fill_gradient(high = ggthemes::ptol_pal()(2)[1], low = "white") + 
+  ylab("") +
+  xlab("Geneset Overlap (N)") +
+  labs(title = "GO Biological Process", subtitle = "Ti Signature", caption = paste0(length(ti.ag.set$ti), " genes"))
+
+plt.ti.go.cc <- go.enrich.ti.cc.sum$plots$ti + 
+  # ggplot(aes(y = reorder(stringr::str_wrap(pathway,25), overlap), x = overlap, fill = -log10(padj))) +
+  # geom_bar(stat = "identity", alpha = 0.8, color = "black") +
+  theme_miko(legend = T, center.title = T) +
+  scale_fill_gradient(high = ggthemes::ptol_pal()(2)[1], low = "white") + 
+  ylab("") +
+  xlab("Geneset Overlap (N)") +
+  labs(title = "GO Cellular Compartment", subtitle = "Ti Signature", caption = paste0(length(ti.ag.set$ti), " genes"))
+
+plt.ti.go.mf <- go.enrich.ti.mf.sum$plots$ti + 
+  # ggplot(aes(y = reorder(stringr::str_wrap(pathway,25), overlap), x = overlap, fill = -log10(padj))) +
+  # geom_bar(stat = "identity", alpha = 0.8, color = "black") +
+  theme_miko(legend = T, center.title = T) +
+  scale_fill_gradient(high = ggthemes::ptol_pal()(2)[1], low = "white") + 
+  ylab("") +
+  xlab("Geneset Overlap (N)") +
+  labs(title = "GO Molecular Function", subtitle = "Ti Signature", caption = paste0(length(ti.ag.set$ti), " genes"))
+
+plt.ag.go <- cowplot::plot_grid(plt.ag.go.bp, plt.ag.go.cc, plt.ag.go.mf, ncol = 1, align = "v", labels = c("A", "B", "C"))
+plt.ti.go <- cowplot::plot_grid(plt.ti.go.bp, plt.ti.go.cc, plt.ti.go.mf, ncol = 1, align = "v", labels = c("D", "E", "F"))
+
+plt.ag.ti.go <- cowplot::plot_grid(plt.ag.go, plt.ti.go, ncol = 2)
+plt.ag.ti.go
+
+
+
+# savePDF("Fig4_sup2C_geneset_annotations_010721.pdf", plt.ag.ti.go, fig.height=9,fig.width=10)
+
+```
+
+```{r csf proteome clinical data prep}
+
+clin.info.path <- "C:/Users/Owner/Dropbox/PDF Projects - JM/Collaborations/Maleeha/Set_2 Clinical Data_Distributed_v2_210121.xlsx"
+clin.info.sheets <- readxl::excel_sheets(clin.info.path)
+
+df.clin.info <- NULL
+for (i in 1:length(clin.info.sheets)){
+  df.clin.cur <- NULL
+  df.clin.cur <- readxl::read_xlsx(clin.info.path, sheet = clin.info.sheets[i])
+  
+  old.fields <- c("Subject #", "Sample ID", "Patient's vital status, alive - 0, dead - 1", "Age", "Sex", "WHO grade", "Treated?",
+                    "Survival, days", "Interval since diagnosis, days", "Interval since last radiotherapy, days", 
+                    "Interval since last intrathecal treatment, days", "Cytology (N-negative, P-positive/atypical, S-suspicious, UNK-study not performed)")
+
+  which.missing <- NULL
+  which.missing <- old.fields[!(old.fields %in% colnames(df.clin.cur))]
+  df.clin.cur2 <- df.clin.cur[ ,old.fields[(old.fields %in% colnames(df.clin.cur))]]
+  df.clin.cur2$type <- clin.info.sheets[i]
+  df.clin.info <- bind_rows(df.clin.info, df.clin.cur2)
+}
+  new.fields <- c("subject", "sample", "alive", "age", "sex", "grade", "treated", "survival_days", "time_since_dx", "time_since_rtx", "time_since_itx", "cytology", "type")
+colnames(df.clin.info) <- new.fields
+
+
+clin.match.path <- "C:/Users/Owner/Dropbox/PDF Projects - JM/Collaborations/Maleeha/CSF_patient_matched_210121.xlsx"
+df.clin.match <- readxl::read_xlsx(clin.match.path)
+colnames(df.clin.match) <- c("subject", "sample_id")
+
+
+df.clin.match$subject <- stringr::str_extract(df.clin.match$subject, "[0-9]*")
+df.clin.match$sample_id <- tolower(gsub("-", "_", df.clin.match$sample_id))
+
+df.clin.info <- merge(df.clin.info, df.clin.match, by = "subject")
+
+
+```
+
+```{r csf proteomic analysis}
+
+
+
+df.prot <- readxl::read_xlsx("C:/Users/Owner/Dropbox/PDF Projects - JM/Collaborations/Maleeha/CSF proteome - with MRD Highlights.xlsx")
+# df.prot <- readxl::read_xlsx("C:/Users/Owner/Dropbox/PDF Projects - JM/Collaborations/Maleeha/CSF_data_Sabra_Jan162021_210121.xlsx", 
+                             # sheet = "all_samples")
+
+
+df.prot <- as.data.frame(df.prot)
+df.prot2 <- df.prot %>% dplyr::select(-c("Uniprot Accession", "Protein.names", "Fasta.headers"))
+df.prot2 <- df.prot2[!is.na(df.prot2$Gene.names), ]
+df.prot2 <- col2rowname(df.prot2, "Gene.names")
+# df.prot2 <- df.prot2[rownames(df.prot2) %in% df.prot.detect$prot, ]
+
+
+# keep.which <- grepl("gbm", colnames(df.prot2))
+# df.prot3 <- df.prot2[, keep.which]
+df.prot3 <- df.prot2
+keep.which2 <- grepl("Int", colnames(df.prot3))
+df.prot4 <- df.prot3[, keep.which2]
+colnames(df.prot4) <- gsub("Int_", "",colnames(df.prot4))
+
+# log transform
+# df.prot4 <- as.data.frame(t(apply(df.prot4, 1, log1p )))
+
+
+all.genes <- rownames(df.prot4)
+
+
+df.prot4.mess <- df.prot4[grepl(";", rownames(df.prot4)), ]
+
+set.match <- c()
+for (i in 1:nrow(df.prot4.mess)){
+  if (grepl(paste(ti.ag.set$ag, collapse = "|"), rownames(df.prot4.mess)[i],  fixed = F )){
+    set.match <- c(set.match, "Ag")
+  } else if (grepl(paste(ti.ag.set$ti, collapse = "|"), rownames(df.prot4.mess)[i],  fixed =F)) {
+    set.match <- c(set.match, "Ti")
+  } else {
+    set.match <- c(set.match, "nope")
+  }
+}
+
+df.prot5 <- df.prot4
+
+df.col.ann <- data.frame(gene = rownames(df.prot5))
+df.col.ann$set <- NA
+
+for (i in 1:nrow(df.col.ann)){
+  if (grepl(paste(ti.ag.set$ag, collapse = "|"), df.col.ann$gene[i])){
+    df.col.ann$set[i] <- "Ag"
+  } else if (grepl(paste(ti.ag.set$ti, collapse = "|"), df.col.ann$gene[i])) {
+    df.col.ann$set[i] <- "Ti"
+  }
+}
+
+df.col.ann <- df.col.ann[complete.cases(df.col.ann), ]
+df.col.ann <- df.col.ann[(df.col.ann$gene %in% ti.ag.set$ag) | (df.col.ann$gene %in% ti.ag.set$ti) | grepl(";", df.col.ann$gene), ]
+df.prot5 <- df.prot5[ rownames(df.prot5) %in% df.col.ann$gene, ]
+
+
+set.ti.ag.csf <- list(
+  ag = df.col.ann$gene[df.col.ann$set == "Ag"],
+    ti = df.col.ann$gene[df.col.ann$set == "Ti"]
+)
+
+# get recovery statistics
+n.match <- nrow(df.prot5)
+n.total <- length(as.vector(unlist(ti.ag.set)))
+prop.recovered <- n.match/n.total
+
+df.col.ann <- col2rowname(df.col.ann, "gene")
+
+
+keep.which <- apply(df.prot5, 1, function(x) mean(x > 0) > 0.1)
+
+df.row.ann <- df.clin.info[ ,c("sample_id","survival_days", "alive", "time_since_dx", "time_since_rtx")]
+df.row.ann <- col2rowname(df.row.ann, "sample_id")
+df.row.ann$alive <- as.character(df.row.ann$alive)
+
+plt.hm.csf <- ggplotify::as.ggplot(pheatmap::pheatmap(df.prot5[keep.which ,], annotation_row = df.col.ann, 
+                                                      annotation_col = df.row.ann, scale = "row", 
+                                                      # breaks = seq(-3, 3),
+                                                       silent = T, border_color = "grey20"))
+
+# a <- data.frame(gene = unlist(df.prot5[1,]), sample = colnames(df.prot5))
+df.cor.input <- merge(
+  data.frame(gene = unlist(df.prot5[1,]), sample = colnames(df.prot5)),
+  data.frame(time = df.row.ann$survival_days, sample = rownames(df.row.ann)),
+  by = "sample"
+)
+
+
+
+
+```
+
+```{r csf cox}
+
+# # univariate (crude) coxph model
+
+df.csf.meta <- df.row.ann
+df.csf.meta$status <- NA
+df.csf.meta$status[df.csf.meta$alive == 1] <- F
+df.csf.meta$status[df.csf.meta$alive == 0] <- T
+df.csf.meta$sample <- rownames(df.csf.meta)
+
+
+df.csf.meta.all <- df.csf.meta
+# df.csf.meta <- df.csf.meta[grepl("gbm", df.csf.meta$sample), ]
+df.csf.meta$sample <- stringr::str_remove(df.csf.meta$sample, "\\.[0-9]*")
+
+df.prot.gbm <- df.prot4
+
+# df.prot.gbm <- df.prot4[, grepl("gbm", colnames(df.prot4))]
+
+keep.which2 <- apply(df.prot.gbm, 1, function(x) mean(x > 0) > 0.25)
+df.prot.gbm <- df.prot.gbm[keep.which2 ,]
+
+gene.of.interest <- rownames(df.prot.gbm)
+df.prot.gbm <- as.data.frame(t(df.prot.gbm))
+df.prot.gbm$sample <- rownames(df.prot.gbm)
+# df.prot.gbm <- df.prot.gbm[grepl("gbm", df.prot.gbm$sample), ]
+
+df.prot.gbm <- merge(df.prot.gbm, df.csf.meta, by = "sample")
+
+#  
+
+```
+
+
+
+
+```{r csf scoring}
+
+# set.ti.ag.csf$ag <- set.ti.ag.csf$ag[set.ti.ag.csf$ag != "EGFR"]
+ti.ag.set.csf <-  set.ti.ag.csf
+# ti.ag.set.csf$ag <- c("PSMB6", "PSMA4", "PSMB8")
+
+# ti.ag.set.csf$ag <-c("UBA52;RPS27A;UBB;UBC", "PSMA7", "PSMA5", "PSMB1", "PSMA2")
+# aggregate scoring #############################################################
+df.csf.col.ann <- NULL
+for (i in 1:length(ti.ag.set.csf)){
+  df.csf.col.ann <- bind_rows(df.csf.col.ann, 
+                              data.frame(set = names(ti.ag.set.csf)[i],
+                                         genes = ti.ag.set.csf[[i]]))
+}
+df.csf.col.ann <- col2rowname(df.csf.col.ann, "genes")
+
+a <- log1p(df.prot4[rownames(as.matrix(df.prot4)) %in% 
+                      unique(unlist(ti.ag.set.csf)), grepl("gbm", colnames(df.prot4))])
+
+plt.hm.csf <- ggplotify::as.ggplot(pheatmap::pheatmap(log1p(df.prot4[rownames(as.matrix(df.prot4)) %in% 
+                                                                       unique(unlist(ti.ag.set.csf)), grepl("gbm", colnames(df.prot4))]),
+                                                      annotation_row = df.csf.col.ann,
+                                                      # scale = "row", 
+                                                      color = viridis::inferno(100), silent = T, border_color = "grey20"))
+
+csf.gsva.scores <- GSVA::gsva(as.matrix(df.prot4[ ,  grepl("gbm", colnames(df.prot4))]), ti.ag.set.csf, method = "gsva", kcdf = "Gaussian")
+
+if (dim(csf.gsva.scores)[1] == 1){
+  df.csf.gsva.score <- data.frame(y1 = csf.gsva.scores[1,], y2 = -csf.gsva.scores[1,], sample = colnames(csf.gsva.scores))
+} else {
+  df.csf.gsva.score <- data.frame(y1 = csf.gsva.scores[1,], 
+                                  y2 = csf.gsva.scores[2,], 
+                                  sample = colnames(csf.gsva.scores))
+}
+
+  # proj scores onto point on line
+# some algebra to find the intersection...
+b <- df.csf.gsva.score$y2 - df.csf.gsva.score$y1
+y = b/2
+x = -b/2
+
+df.csf.gsva.score$proj.x <- -b/2
+df.csf.gsva.score$proj.y <- b/2
+  
+  df.csf.gsva.score$score <- sqrt((df.csf.gsva.score$proj.x^2) + (df.csf.gsva.score$proj.y^2))
+  df.csf.gsva.score$score <- df.csf.gsva.score$score * sign(df.csf.gsva.score$proj.x)
+
+  df.csf.gsva.score$sample_id <- gsub("Int_", "", df.csf.gsva.score$sample)
+  
+  df.csf.gsva.score <- merge(df.csf.gsva.score, df.clin.info, by = "sample_id")
+  
+  df.csf.gsva.score.gbm <- df.csf.gsva.score %>% dplyr::filter(grepl("gbm", sample_id))
+  csf.cor <- signif(cor(df.csf.gsva.score.gbm$y1, df.csf.gsva.score.gbm$y2, method = "spearman"), 2)
+  plt.gsva.scores.csf <- df.csf.gsva.score %>%
+    dplyr::filter(grepl("gbm", sample_id)) %>%
+    ggplot() +
+    geom_abline(slope = -1) + 
+    geom_segment(aes(x = y1, xend = proj.x, y = y2, yend = proj.y), color = "black") + 
+    ggrepel::geom_text_repel(aes(y1, y2, label = gsub("Int_gbm_", "", sample_id)), color = "grey", size = 2) +
+    geom_vline(xintercept = 0, color = "grey", size = 1) + 
+    geom_point(aes(y1, y2), color = "black") + 
+    geom_hline(yintercept = 0, color = "grey", size = 1) +
+    geom_point(aes(proj.x, proj.y, fill = score), size = 2, shape = 21) + #, color = "tomato"
+    viridis::scale_fill_viridis() + 
+    theme_miko(legend = T) +
+    xlab("Ag Signature (GSVA)") + 
+    ylab("Ti Signature (GSVA)") + 
+    labs(title = "GBM Prognostic Scores", subtitle = paste0("CSF Proteomics; rho = ", csf.cor),
+         caption = "colored point = projected score, black point = gsva scores", fill = "Score")
+
+  plt.hm.csf
+  plt.gsva.scores.csf
+
+```
+
+
+```{r protein-level survival CSF}
+
+# csf.gsva.scores <- GSVA::gsva(as.matrix(df.prot4[ ,  grepl("gbm", colnames(df.prot4))]), ti.ag.set.csf, method = "gsva", kcdf = "Gaussian")
+# 
+im.gene <- c(ti.ag.set.csf$ag,ti.ag.set.csf$ti )
+
+plt.gene.component <- list()
+for (i in 1:length(im.gene)){
+  
+  df.csf.gene.score <- data.frame(y1 = unlist(df.prot4[im.gene[i], ]),sample_id = colnames(df.prot4))
+  # df.csf.gene.score <- 
+  
+   df.csf.gene.score <- merge(df.csf.gene.score, df.clin.info, by = "sample_id")
+   
+   df.csf.gene.score <- df.csf.gene.score %>% dplyr::filter(grepl("gbm", sample_id))
+   
+   df.csf.gene.score$status <- NA
+df.csf.gene.score$status[df.csf.gene.score$alive == 1] <- FALSE
+df.csf.gene.score$status[df.csf.gene.score$alive == 0] <- TRUE
+
+
+df.csf.gene.score$ag.level <- NA
+df.csf.gene.score$ag.level[df.csf.gene.score$y1 <= median(df.csf.gene.score$y1) ] <-   "low"
+df.csf.gene.score$ag.level[df.csf.gene.score$y1 > median(df.csf.gene.score$y1) ] <- "high"
+# df.csf.gene.score$ag.level[df.csf.gene.score$y1 <= 0 ] <-   "low"
+# df.csf.gene.score$ag.level[df.csf.gene.score$y1 > 0 ] <- "high"
+
+df.csf.gene.score$time <- as.numeric(df.csf.gene.score$time_since_rtx)
+# df.csf.gene.score$time <- as.numeric(df.csf.gene.score$time_since_dx)
+
+surv.obj.uni <- Surv(df.csf.gene.score$time, df.csf.gene.score$status, type = "right")
+
+
+plt.csf.gene.surv <- ggsurvplot(survfit(surv.obj.uni ~ (ag.level) , data =df.csf.gene.score), 
+                               conf.int = F, pval = T, risk.table = F,  
+                               title = paste0(im.gene[i]), surv.median.line = "hv")
+
+plt.gene.component[[im.gene[i]]] <- plt.csf.gene.surv$plot
+print(plt.csf.gene.surv$plot)
+  
+}
+
+
+
+```
+
+```{r fig.width=12, fig.height=7}
+
+cowplot::plot_grid(plotlist = plt.gene.component, nrow = 2)
+```
+
+```{r csf survival analysis}
+
+# "BrainMet" "PCNSL"
+df.csf.gsva.score$status <- NA
+df.csf.gsva.score$status[df.csf.gsva.score$alive == 1] <- FALSE
+df.csf.gsva.score$status[df.csf.gsva.score$alive == 0] <- TRUE
+
+df.csf.gsva.score$time <- as.numeric(df.csf.gsva.score$time_since_dx)
+df.csf.surv <- NULL
+
+df.surv.csf <- df.csf.gsva.score %>% dplyr::filter(type == "GBM")
+df.surv.csf$score.level <- NA
+df.surv.csf$score.level[df.surv.csf$score < 0 ] <-   "low"
+df.surv.csf$score.level[df.surv.csf$score >=0 ] <- "high"
+df.surv.csf$ag.level <- NA
+df.surv.csf$ag.level[df.surv.csf$y1 < median(df.surv.csf$y1) ] <-   "low"
+df.surv.csf$ag.level[df.surv.csf$y1 >= median(df.surv.csf$y1) ] <- "high"
+
+df.surv.csf$ti.level <- NA
+df.surv.csf$ti.level[df.surv.csf$y2 <= median(df.surv.csf$y2) ] <-   "low"
+df.surv.csf$ti.level[df.surv.csf$y2 > median(df.surv.csf$y2) ] <- "high"
+
+surv.obj.uni <- Surv(df.surv.csf$time, df.surv.csf$status, type = "right")
+
+df.surv.csf$ag.stat <- NA
+df.surv.csf$ag.stat[df.surv_ag$ag.level == "low"] <- "C"
+df.surv.csf$ag.stat[df.surv_ag$ag.level == "high"] <- "E"
+cox.csf.ag <- coxph(surv.obj.uni ~ score.level, data = df.surv.csf)
+
+plt.csf.score.surv <- ggsurvplot(survfit(surv.obj.uni ~ (score.level) , data =df.surv.csf), 
+                               conf.int = F, pval = T, risk.table = F,  
+                               title = paste0("Kaplan-Meier\nComposite Score"), surv.median.line = "hv")
+
+plt.csf.ag.surv <- ggsurvplot(survfit(surv.obj.uni ~ ag.level , data =df.surv.csf ), 
+                               conf.int = F, pval = T, risk.table = F,
+                               title = paste0("Kaplan-Meier\nAg Score"), surv.median.line = "hv")
+
+plt.csf.ti.surv <- ggsurvplot(survfit(surv.obj.uni ~ ti.level , data =df.surv.csf ), 
+                               conf.int = F, pval = T, risk.table = F,
+                               title = paste0("Kaplan-Meier\nTi Score"), surv.median.line = "hv")
+
+
+plt.csf.ag.surv2 <- plt.csf.ag.surv$plot + theme_miko(legend = T, color.palette = "ptol")
+plt.csf.ti.surv2 <- plt.csf.ti.surv$plot + theme_miko(legend = T, color.palette = "ptol")
+
+plt.csf.ag.surv2
+plt.csf.ti.surv2
+
+
+```
+
+
+```{r dot plot helper }
+
+
+pltDot <- function(df, feature.field, effect.field, size.field, top.n = 10, include.features = NULL, flag.features = NULL,
+                   plt.title = "", plt.subtitle = "", only.specified.features = F, truncate.feature = F){
+  
+  
+  df.top <- (df %>% dplyr::arrange(get(effect.field)))[1:10, ]
+  df.top$type <- "other"
+  df.bottom<- (df %>% dplyr::arrange(-get(effect.field)))[1:10, ]
+  df.bottom$type <- "other"
+  df.extra <- NULL
+  if (!is.null(include.features)){
+    for (i in 1:length(include.features)){
+      df.current <- NULL
+      df.current <- df %>% dplyr::filter(get(feature.field) %in% include.features[[i]])
+      if (nrow(df.current) == 0) next
+      df.current$type <- names(include.features)[i]
+      df.extra <- bind_rows(df.extra, df.current)
+    }
+  }
+  if (!is.null(flag.features)){
+    for (i in 1:length(flag.features)){
+      df.current <- NULL
+      df.current <- df %>% dplyr::filter(grepl(tolower(flag.features[[i]]), tolower(get(feature.field)) ))
+      if (nrow(df.current) == 0) next
+      df.current$type <- names(flag.features)[i]
+      df.extra <- bind_rows(df.extra, df.current)
+    }
+  }
+  
+  if (only.specified.features){
+    df.sub <- df.extra
+  } else {
+    df.sub <- bind_rows(df.top, df.bottom, df.extra)
+  }
+  
+  if (truncate.feature){
+    df.sub$pathway <- stringr::str_trunc(df.sub$pathway, 40)
+  }
+  
+  plt.dot <- df.sub %>%
+    ggplot(aes(x = get(effect.field), 
+               y = reorder(get(feature.field), get(effect.field))))+ 
+    geom_segment(aes(yend = reorder(get(feature.field), get(effect.field)), xend = 0)) + 
+        geom_point(aes(size = -log1p(get(size.field)), color =  type)) +
+    theme_miko(color.palette = "ptol", legend = T) + 
+    labs(title = plt.title, subtitle = plt.subtitle, size = size.field) + 
+    ylab(feature.field) + xlab(effect.field) + 
+    geom_vline(xintercept = 0, linetype = "dashed") 
+  
+  return(plt.dot)
+}
+
+
+deg.sc <- so.markers.all[so.markers.all$cluster %in% group.1.name, ]
+deg.sc.agti <- list(
+  ag = ti.ag.set$ag,
+  ti = ti.ag.set$ti
+)
+
+
+
+
+```
+
+
+```{r survival analyses, fig.width=12, fig.height=8}
+
+# TCGA Survival Analysis #######################################################
+df.surv_ag <- df.surv
+surv.obj_ag <- Surv(df.surv_ag$time, df.surv_ag$status)
+
+df.surv_ag$ag.stat <- NA
+df.surv_ag$ag.stat <- "C"
+df.surv_ag$ag.stat[df.surv_ag$y1 >  median(df.surv_ag$y1, na.rm =)] <- "E"
+cox.ag <- coxph(surv.obj_ag ~ y1, data = df.surv_ag)
+summary(cox.ag)
+
+df.surv_ag$ag.auc <- "unresolved"
+df.surv_ag$ag.auc[df.surv_ag$y1 > median(df.surv_ag$y1)] <- "ag"
+
+plt.surv.auc_ag <- ggsurvplot(survfit(surv.obj_ag ~ ag.auc, data = df.surv_ag),
+           conf.int = F, pval = T, risk.table = F,
+           title = "Kaplan-Meier: Ag", surv.median.line = "hv")
+plt.surv.auc_ag2 <- plt.surv.auc_ag[["plot"]]  + theme_miko(legend = T, color.palette = "ptol") + labs(subtitle = "CL + ME") + 
+  theme(legend.position = "bottom") + 
+  scale_color_manual(values = c(ggthemes::ptol_pal()(2)[2], "black"), labels = c("high", "low")) + 
+  labs(title = "TCGA Transcriptomics", subtitle = "Ag-dependent Survival",
+       caption = paste0("n = ", nrow(surv.obj_ag), " samples"))
+
+df.surv_ti <- df.surv
+
+surv.obj_ti <- Surv(df.surv_ti$time, df.surv_ti$status)
+
+df.surv_ti$ti.stat <- "C"
+df.surv_ti$ti.stat[df.surv_ti$y2 >  median(df.surv_ti$y2, na.rm =)] <- "E"
+
+cox.ti <- coxph(surv.obj_ti ~ y2, data = df.surv_ti)
+summary(cox.ti)
+
+df.surv_ti$ti.auc <- "unresolved"
+df.surv_ti$ti.auc[df.surv_ti$y2 > median(df.surv_ag$y2)] <- "ag"
+
+plt.surv.auc_ti <- ggsurvplot(survfit(surv.obj_ti ~ ti.auc, data = df.surv_ti),
+           conf.int = F, pval = T, risk.table = F,
+           title = "Kaplan-Meier: Ti", surv.median.line = "hv")
+plt.surv.auc_ti2 <- plt.surv.auc_ti[["plot"]]  + theme_miko(legend = T, color.palette = "ptol") + labs(subtitle = "CL + ME") + 
+  theme(legend.position = "bottom") + 
+  scale_color_manual(values = c(ggthemes::ptol_pal()(2)[1], "black"), labels = c("high", "low")) + 
+  labs(title = "TCGA Transcriptomics", subtitle = "Ti-dependent Survival",
+       caption = paste0("n = ", nrow(df.surv_ti), " samples"))
+
+plt.tcga.panel <- cowplot::plot_grid(plt.surv.auc_ag2, plt.surv.auc_ti2, ncol = 2)
+
+
+# CSF Survival Analysis ########################################################
+
+plt.csf.ag.surv2 <- plt.csf.ag.surv2 + labs(title = "CSF Proteomics", subtitle = "Ag-dependent Survival",
+       caption = paste0("n = ", nrow(df.surv.csf), " samples")) + 
+  xlab("Time (d)") + theme(legend.position = "bottom") + 
+  scale_color_manual(values = c(ggthemes::ptol_pal()(2)[2], "black"), labels = c("high", "low"))
+
+plt.csf.ti.surv2 <-  plt.csf.ti.surv2 + labs(title = "CSF Proteomics", subtitle = "Ti-dependent Survival",
+       caption = paste0("n = ", nrow(df.surv.csf), " samples")) + 
+  xlab("Time (d)") + theme(legend.position = "bottom") + 
+  scale_color_manual(values = c(ggthemes::ptol_pal()(2)[1], "black"), labels = c("high", "low"))
+
+plt.csf.panel <- cowplot::plot_grid(plt.csf.ag.surv2, plt.csf.ti.surv2, ncol = 2)
+
+
+plt.tcga.csf.surv <- cowplot::plot_grid(plt.tcga.panel, plt.csf.panel, ncol = 1, labels = c("C", "D"))
+
+# MRD survival analysis ########################################################
+
+plt.bulk.gsva.ag <- df.mod.path.bulk %>%
+  dplyr::filter(sample %in% which.samples) %>%
+  ggplot(aes(x = Ag, y = months, label = line)) +
+  geom_smooth(method = "lm", color = ggthemes::ptol_pal()(2)[2]) + 
+  geom_text() + 
+  geom_vline(xintercept = 0, linetype = "dashed") + 
+  theme_miko()+
+  
+  stat_poly_eq(formula = my.form, 
+               aes(label = paste(..rr.label.., stat(p.value.label),  sep = "~~~")), 
+               parse = TRUE, rr.digits = 2, p.digits = 2) +
+  labs(title = "Ag", subtitle = paste0(length(ag.set), " genes")) + 
+  xlab("Ag Signature") + 
+  ylab("Survival (Months)")
+
+plt.bulk.gsva.ti <-  df.mod.path.bulk %>%
+  dplyr::filter(sample %in% which.samples) %>%
+  ggplot(aes(x = Ti, y = months, label = line)) +
+  geom_smooth(method = "lm", color = ggthemes::ptol_pal()(2)[1]) + 
+  geom_text() + 
+  geom_vline(xintercept = 0, linetype = "dashed") + 
+  theme_miko()+
+  stat_poly_eq(formula = my.form, 
+               aes(label = paste(..rr.label.., stat(p.value.label),  sep = "~~~")), 
+               parse = TRUE, rr.digits = 2, p.digits = 2) +
+  labs(title = "Ti", subtitle = paste0(length(ti.set), " genes")) + 
+  xlab("Ti Signature") + 
+  ylab("Survival (Months)")
+
+# plt.gsva.suvival.bulk
+
+plt.bulk.surv <- cowplot::plot_grid(
+    plt.gsva.suvival.bulk,
+  plt.bulk.gsva.list[[3]],
+  ncol = 1,
+  rel_heights = c(1,1.5),
+  labels = c("A", "B")
+)
+
+plt.tcga.csf.surv
+
+```
+
+
+```{r FINAL Ag validation plot, fig.height=5, fig.width=16}
+
+plt.ag.prog <- df.mod.gbm.mel %>%
+  ggplot() +
+  geom_point(aes(x = condition, y = ag, color = sample), size =4) + 
+  geom_path(aes(x = condition, y = ag, group = sample, color = sample)) + 
+  xlab("Phase") + 
+  ylab("Signature Activity") + 
+  theme_miko(legend = T, color.palette = "ptol") +
+  labs(title = "Ag Score Progression", subtitle = "Signature Activity Scores", color = "Sample") 
+
+
+plt.ti.prog <- df.mod.gbm.mel %>%
+  ggplot() +
+  geom_point(aes(x = condition, y = ti, color = sample), size =4) + 
+  geom_path(aes(x = condition, y = ti, group = sample, color = sample)) + 
+  xlab("Phase") + 
+  ylab("Signature Activity") + 
+  theme_miko(legend = T, color.palette = "ptol") +
+  labs(title = "Ti Score Progression", subtitle = "Signature Activity Scores", color = "Sample") 
+ 
+
+plt.val.ag <- cowplot::plot_grid(plt.ag.prog + theme(legend.position = "bottom"), plt.bulk.gsva.ag + 
+                     labs(caption = ("n = 5 samples\nBulk RNA"), title = "MRD Transcriptomics", 
+                          subtitle = "Ag-dependent Survival", x = "GSVA score (Ag Signature)") + 
+                     coord_cartesian(ylim  = c(0, max(plt.bulk.gsva.ag$data$months) * 1.1)), 
+                   plt.surv.auc_ag2, plt.csf.ag.surv2, ncol = 4, align = "h", axis = "b", labels = "AUTO")
+
+plt.val.ti <- cowplot::plot_grid(plt.ti.prog + theme(legend.position = "bottom"), 
+                    plt.bulk.gsva.ti + labs(caption = ("n = 5 samples\nBulk RNA"), title = "MRD Transcriptomics", 
+                                        subtitle = "Ti-dependent Survival", x = "GSVA score (Ti Signature)") + 
+                                   coord_cartesian(ylim  = c(0, max(plt.bulk.gsva.ti$data$months) * 1.1)), 
+                                 plt.surv.auc_ti2, plt.csf.ti.surv2, ncol = 4, align = "h", axis = "b", labels = "AUTO")
+
+
+plt.val.ag
+
+plt.val.ti
+
+# savePDF("Fig4FH_ag_validation.pdf", plt.val.ag,  fig.height=5, fig.width=16)
+# savePDF("Fig4_sup3AB_ti_validation.pdf", plt.val.ti,  fig.height=5, fig.width=16)
+
+ 
+```
+
+
+```{r import zhao 2019 data}
+
+
+
+df.zhao <- read.csv(file = "C:/Users/Owner/Dropbox/PDF Projects - JM/Data/scRNA-seq/01_sci-RNA-seq3_Hong_Kevin_Jason/NM_HH/Data/Results/GBM (UHN)/Zhao2019_NatureMedicine/RPKM_matrix.csv")
+
+df.zhao.patient <- readxl::read_xlsx( "C:/Users/Owner/Dropbox/PDF Projects - JM/Data/scRNA-seq/01_sci-RNA-seq3_Hong_Kevin_Jason/NM_HH/Data/Results/GBM (UHN)/Zhao2019_NatureMedicine/GBM_PD1_samples_NMclean.xlsx")
+
+
+
+# which.set <- "ti"
+
+df.zhao <- col2rowname(df.zhao, "X")
+
+```
+
+
+```{r Zhao 2019 nature medicine validation}
+
+
+
+df.zhao <- read.csv(file = "C:/Users/Owner/Dropbox/PDF Projects - JM/Data/scRNA-seq/01_sci-RNA-seq3_Hong_Kevin_Jason/NM_HH/Data/Results/GBM (UHN)/Zhao2019_NatureMedicine/RPKM_matrix.csv")
+
+df.zhao.patient <- readxl::read_xlsx( "C:/Users/Owner/Dropbox/PDF Projects - JM/Data/scRNA-seq/01_sci-RNA-seq3_Hong_Kevin_Jason/NM_HH/Data/Results/GBM (UHN)/Zhao2019_NatureMedicine/GBM_PD1_samples_NMclean.xlsx")
+
+df.zhao.patient2 <- read.csv( "C:/Users/Owner/Dropbox/PDF Projects - JM/Data/scRNA-seq/01_sci-RNA-seq3_Hong_Kevin_Jason/NM_HH/Data/Results/GBM (UHN)/Zhao2019_NatureMedicine/patient_characteristics_FigS1.csv")
+colnames(df.zhao.patient2) <- rmvCSVprefix(colnames(df.zhao.patient2))
+
+df.zhao.patient <- merge(df.zhao.patient,df.zhao.patient2, by = "patient_id")
+
+
+
+
+
+which.set <- "ag"
+
+df.zhao <- col2rowname(df.zhao, "X")
+
+zhao.col <- gsub("\\.", "-", gsub("X", "",colnames(df.zhao) ))
+colnames(df.zhao) <- zhao.col
+
+df.zhao.ag.ti <- df.zhao[rownames(df.zhao) %in% unlist(ti.ag.set[[which.set]]), ]
+
+df.zhao.patient <- as.data.frame(df.zhao.patient)
+
+df.zhao.patient <- df.zhao.patient %>% dplyr::filter(pre_pos == "pre")
+
+
+# GSVA
+zhao.gsva <- GSVA::gsva(expr = as.matrix(df.zhao), gset.idx.list = ti.ag.set[which.set], method = "gsva")
+# zhao.gsva <- GSVA::gsva(expr = as.matrix(df.zhao), gset.idx.list = list(ag = c("PSMB6", "PSMA4", "PSMB8")), method = "gsva")
+
+df.gsva.score <- data.frame(sample_name = colnames(zhao.gsva), gsva = zhao.gsva[1,])
+df.gsva.score <- merge(df.gsva.score, df.zhao.patient,  by = "sample_name")
+
+
+df.gsva.score$alive <- df.gsva.score$alive_status == 0
+
+df.gsva.score$response2 <- NA
+df.gsva.score$response2[df.gsva.score$response == "Yes"] <- "Responder"
+df.gsva.score$response2[df.gsva.score$response == "No"] <- "Non-Responder"
+plt.box.zhao <- df.gsva.score %>%
+  ggplot(aes(x = alive, y = gsva)) + 
+  geom_boxplot(fill = "grey") + 
+  geom_point() + 
+  labs(title = "Im score by response and survival status", y = "Im score (GSVA)", x = "Alive")  + 
+  facet_wrap(~response2, ncol = 1) + theme_miko(legend = F)
+
+
+plt.box.zhao <- df.gsva.score %>%
+  ggplot(aes(x = alive, y = gsva)) + 
+  geom_boxplot(fill = "grey") + 
+  geom_point() + 
+  labs(title = "Im score by response and survival status", y = "Im score (GSVA)", x = "Alive")  + 
+  facet_wrap(~response2, ncol = 1) + theme_miko(legend = F)
+
+
+df.gsva.score %>%
+  ggplot(aes(x = response2, y = gsva)) + 
+  geom_boxplot(fill = "grey") + 
+  geom_point() + 
+  labs(title = "Im score by response and survival status", y = "Im score (GSVA)", x = "Alive")  + 
+  theme_miko(legend = F)
+
+
+plt.box.zhao
+
+
+df.gsva.score$is.resp <- df.gsva.score$response == "Yes"
+df.gsva.score$is.steroid_w_tx <- grepl("yes", tolower(df.gsva.score$steroid_w_tx))
+df.gsva.score$is.steroid_during_tx <- grepl("yes", tolower(df.gsva.score$steroids_during_pd1))
+df.gsva.score$pfd_days_from_pd1 <- as.numeric(df.gsva.score$pfd_days_from_pd1)
+df.gsva.score$pfs_months <- as.numeric(df.gsva.score$pfs_months)
+
+```
+
+```{r responder DEG}
+
+df.zhao.patient <- df.zhao.patient %>% dplyr::filter(pre_pos == "pre")
+df.zhao.so <- df.zhao[ ,colnames(df.zhao) %in% df.zhao.patient$sample_name]
+
+so.zhao <- CreateSeuratObject(df.zhao.so)
+
+so.zhao@meta.data$responder <- F
+so.zhao@meta.data$responder[colnames(so.zhao) %in% df.zhao.patient$sample_name[df.zhao.patient$response == "Yes"]] <- T
+
+# GSVA
+df.deg.zhao <- presto::wilcoxauc(X = so.zhao, seurat_assay = "RNA", group_by = "responder")
+df.deg.zhao <- df.deg.zhao %>% dplyr::filter(group == "TRUE", pval < 0.05)
+
+responder.gene <- df.deg.zhao$feature[df.deg.zhao$auc > 0.8]
+non.responder.gene <- df.deg.zhao$feature[df.deg.zhao$auc < 0.2]
+
+df.tcga.gsva.zhao <- TCGAscores(gbm.mat,so.sig.set = NULL, gbm.meta.sub, deg.gene.sets = list(
+  set1 = responder.gene ,
+  set2 = non.responder.gene
+))
+
+hg.deg <- runHG(gene.list = list(deg = ag.set), species = "Hs", gene.universe = rownames(so.0231))
+hg.deg.sum <- summarizeHG(hg.deg)
+
+df.tcga.gsva.zhao.agti <- TCGAscores(gbm.mat,so.sig.set = NULL, gbm.meta.sub, deg.gene.sets = list(
+  set1 = ag.set,
+  set2 = ti.set
+))
+
+df.tcga.gsva.zhao %>%
+  ggplot(aes(x = y1, y = y2)) + 
+  geom_point()
+
+
+df.surv.zhao <- data.frame(
+  score.responder = df.tcga.gsva.zhao$y1,
+   score.non.responder = df.tcga.gsva.zhao$y2,
+  score.ag8 = df.tcga.gsva.zhao.agti$y1,
+  score.ag3 = df.tcga.gsva.zhao.agti$y2,
+  time  = df.tcga.gsva.modpath$dtf,
+  alive = df.tcga.gsva.modpath$alive,
+  t.subtype = df.tcga.gsva.zhao.agti$t.subtype
+)
+df.surv.zhao$status <- NA
+df.surv.zhao$status[df.surv.zhao$alive == "Alive"] <- FALSE
+df.surv.zhao$status[df.surv.zhao$alive == "Dead"] <- TRUE
+
+
+####################
+surv.obj.zhao.so <- Surv(df.surv.zhao$time, df.surv.zhao$status, type = "right")
+
+cox.zhao.resp.score <- coxph(surv.obj.zhao.so ~ score.ag3 +score.responder , data = df.surv.zhao)
+summary(cox.zhao.resp.score)
+
+df.surv.zhao$ag8 <- "low"
+df.surv.zhao$ag8[df.surv.zhao$score.ag8 > median(df.surv.zhao$score.ag8)] <- "high"
+
+df.surv.zhao$ag3 <- "low"
+df.surv.zhao$ag3[df.surv.zhao$score.ag3 > median(df.surv.zhao$score.ag3)] <- "high"
+
+df.surv.zhao$resp <- "low"
+df.surv.zhao$resp[df.surv.zhao$score.responder > median(df.surv.zhao$score.responder)] <- "high"
+
+df.surv.zhao$noresp <- "low"
+df.surv.zhao$noresp[df.surv.zhao$score.non.responder > median(df.surv.zhao$score.non.responder)] <- "high"
+
+plt.zhao.score <- ggsurvplot(survfit(surv.obj.zhao.so ~ ag3, data =df.surv.zhao), 
+                               conf.int = F, pval = T, risk.table = F,  
+                               title = paste0("MBT06 - BT799 Signature"), surv.median.line = "hv")
+plt.zhao.score
+plt.zhao.score <- ggsurvplot(survfit(surv.obj.zhao.so ~ ag8, data =df.surv.zhao), 
+                               conf.int = F, pval = T, risk.table = F,  
+                               title = paste0("MBT06 - BT799 Signature"), surv.median.line = "hv")
+
+plt.zhao.score
+plt.zhao.score.surv.Res <- ggsurvplot(survfit(surv.obj.zhao.uni.Resp ~ Im.status , data =df.gsva.score.Res), 
+                               conf.int = F, pval = T, risk.table = F,  
+                               title = paste0("Kaplan-Meier\nResponders"), surv.median.line = "hv")
+
+plt.zhao.score.surv.Res
+  
+```
+
+
+```{r leave one out sensitivity}
+
+
+plt.survival.sensitivity.list <- list()
+for (i in 1:length(ag.set)){
+  
+  try({
+    
+  df.tcga.gsva.zhao.agti <- TCGAscores(gbm.mat,so.sig.set = NULL, gbm.meta.sub, deg.gene.sets = list(
+  set1 = ag.set[ag.set != ag.set[i]] ,
+  set2 = ag.set[i]
+))
+
+df.surv.zhao <- data.frame(
+  score.responder = df.tcga.gsva.zhao$y1,
+   score.non.responder = df.tcga.gsva.zhao$y2,
+  score.ag8 = df.tcga.gsva.zhao.agti$y1,
+  score.ag3 = df.tcga.gsva.zhao.agti$y2,
+  time  = df.tcga.gsva.modpath$dtf,
+  alive = df.tcga.gsva.modpath$alive,
+  t.subtype = df.tcga.gsva.zhao.agti$t.subtype
+)
+df.surv.zhao$status <- NA
+df.surv.zhao$status[df.surv.zhao$alive == "Alive"] <- FALSE
+df.surv.zhao$status[df.surv.zhao$alive == "Dead"] <- TRUE
+
+
+####################
+surv.obj.zhao.so <- Surv(df.surv.zhao$time, df.surv.zhao$status, type = "right")
+
+
+df.surv.zhao$ag8 <- "low"
+df.surv.zhao$ag8[df.surv.zhao$score.ag8 > median(df.surv.zhao$score.ag8)] <- "high"
+
+df.surv.zhao$ag3 <- "low"
+df.surv.zhao$ag3[df.surv.zhao$score.ag3 > median(df.surv.zhao$score.ag3)] <- "high"
+
+
+plt.without_gene <- ggsurvplot(survfit(surv.obj.zhao.so ~ ag8, data =df.surv.zhao), 
+                               conf.int = F, pval = T, risk.table = F,  
+                               title = paste0("without ", ag.set[i]), surv.median.line = "hv")$plot +  #Im signature 
+  theme_miko(legend = T, color.palette = "ptol") + 
+  theme(legend.position = "bottom") + 
+  scale_color_manual(values = c(ggthemes::ptol_pal()(2)[2], "black"), labels = c("high", "low")) +
+  labs(subtitle = "TCGA Transcriptomics", caption = NULL)
+
+plt.gene_only <- ggsurvplot(survfit(surv.obj.zhao.so ~ ag3, data =df.surv.zhao), 
+                               conf.int = F, pval = T, risk.table = F,  
+                               title = paste0(ag.set[i], " only"), surv.median.line = "hv")$plot + 
+  theme_miko(legend = T, color.palette = "ptol") + 
+  theme(legend.position = "bottom") + 
+  scale_color_manual(values = c(ggthemes::ptol_pal()(2)[2], "black"), labels = c("high", "low")) +
+  labs(subtitle = "TCGA Transcriptomics", caption = NULL)
+
+plt.survival.sensitivity <- cowplot::plot_grid(plt.gene_only, plt.without_gene)
+print(plt.survival.sensitivity)
+
+plt.survival.sensitivity.list[[ag.set[i]]] <- plt.survival.sensitivity
+
+}, silent= T)
+}
+
+
+
+```
+
+```{r fig.width=15, fig.height=17}
+
+plt.all.component.surv <- cowplot::plot_grid(plotlist = plt.survival.sensitivity.list, labels = "AUTO", ncol = 3)
+
+# savePDF("Fig4_sup3C_survival_sensitivity_analysis.pdf", plt.all.component.surv, fig.width=15, fig.height=17)
+```
+
+
+```{r}
+
+df.tcga.gsva.zhao.agti <- TCGAscores(gbm.mat,so.sig.set = NULL, gbm.meta.sub, deg.gene.sets = list(
+  set1 = ag.set ,
+  # set2 = c("PSMB6", "PSMA4", "PSMB8")
+  # set2 = deg.up
+  set2 = ti.set
+  # set2 = c("S100A10", "CLIC1", "NEAT1", "SEC61G", "B2M", "HLA-B", "ATP5G3")
+  # set2 = c("UBB", "PSMB1", "PSMA7", "PSMA5", "PSMA2")
+))
+
+
+# plot(df.tcga.gsva.zhao$y2, df.tcga.gsva.zhao.agti$y1)
+df.tcga.gsva.zhao %>%
+  ggplot(aes(x = y1, y = y2)) + 
+  geom_point()
+
+
+df.surv.zhao <- data.frame(
+  score.responder = df.tcga.gsva.zhao$y1,
+   score.non.responder = df.tcga.gsva.zhao$y2,
+  score.ag8 = df.tcga.gsva.zhao.agti$y1,
+  score.ag3 = df.tcga.gsva.zhao.agti$y2,
+  time  = df.tcga.gsva.modpath$dtf,
+  alive = df.tcga.gsva.modpath$alive,
+  t.subtype = df.tcga.gsva.zhao.agti$t.subtype
+)
+
+df.surv.zhao$status <- NA
+df.surv.zhao$status[df.surv.zhao$alive == "Alive"] <- FALSE
+df.surv.zhao$status[df.surv.zhao$alive == "Dead"] <- TRUE
+
+for (i in 1:length(ag.set)){
+  
+  df.surv.gene <-df.surv.zhao
+  
+  if (sum(rownames(gbm.mat) %in% ag.set[i]) != 1) next
+  df.surv.gene$expr <- gbm.mat[rownames(gbm.mat) %in% ag.set[i],  ]
+  surv.obj.gene <- Surv(df.surv.gene$time, df.surv.gene$status, type = "right")
+  
+  df.surv.gene$expr.status <- "low"
+df.surv.gene$expr.status[df.surv.gene$expr > median(df.surv.gene$expr, na.rm = T)] <- "high"
+  
+  plt.zhao.score <- ggsurvplot(survfit(surv.obj.gene ~ expr.status, data =df.surv.gene), 
+                               conf.int = F, pval = T, risk.table = F,  
+                               title = ag.set[i], surv.median.line = "hv")
+print(plt.zhao.score$plot)
+
+}
+
+```
+
+
+
+```{r, fig.width=8, fig.height=5}
+
+# df.gsva.score2 <- df.gsva.score
+
+df.gsva.score$Im.status <- NA
+df.gsva.score$Im.status[df.gsva.score$gsva >= median(df.gsva.score$gsva)] <- "high"
+df.gsva.score$Im.status[df.gsva.score$gsva < median(df.gsva.score$gsva)] <- "low"
+
+# df.gsva.score$Im.status[df.gsva.score$gsva >=0] <- "high"
+# df.gsva.score$Im.status[df.gsva.score$gsva < 0] <- "low"
+
+
+
+df.gsva.score.noResp <- df.gsva.score %>% dplyr::filter(response == "No")
+df.gsva.score.Res <- df.gsva.score %>% dplyr::filter(response == "Yes")
+
+# df.gsva.score.noResp <- df.gsva.score %>% dplyr::filter(pre_pos == "pre")
+# df.gsva.score.Res <- df.gsva.score %>% dplyr::filter(pre_pos == "post")
+
+surv.obj.zhao.uni.noResp <- Surv(df.gsva.score.noResp$os_days_from_dx, df.gsva.score.noResp$alive_status, type = "right")
+surv.obj.zhao.uni.Resp <- Surv(df.gsva.score.Res$os_days_from_dx, df.gsva.score.Res$alive_status, type = "right")
+
+# df.surv.csf$ag.stat <- NA
+# df.surv.csf$ag.stat[df.surv_ag$ag.level == "low"] <- "C"
+# df.surv.csf$ag.stat[df.surv_ag$ag.level == "high"] <- "E"
+cox.zhao.ag.noResp <- coxph(surv.obj.zhao.uni.noResp ~ gsva, data = df.gsva.score.noResp)
+cox.zhao.ag.Resp <- coxph(surv.obj.zhao.uni.Resp ~ gsva, data = df.gsva.score.Res)
+
+summary(cox.zhao.ag.noResp)
+summary(cox.zhao.ag.Resp)
+
+# plt.zhao.score.surv <- ggsurvplot(survfit(surv.obj.zhao.uni ~ is.steroid_w_tx , data =df.gsva.score2), 
+#                                conf.int = F, pval = T, risk.table = F,  
+#                                title = paste0("Kaplan-Meier\nComposite Score"), surv.median.line = "hv")
+
+plt.zhao.score.surv.noRes <- ggsurvplot(survfit(surv.obj.zhao.uni.noResp ~ Im.status  , data =df.gsva.score.noResp), 
+                               conf.int = F, pval = T, risk.table = F,  
+                               title = paste0("Immunotherapy Non-Responders"), surv.median.line = "hv")$plot + 
+  theme_miko(legend = T, color.palette = "ptol") + 
+  # labs(subtitle = "CL + ME") + 
+  theme(legend.position = "bottom") + 
+  scale_color_manual(values = c(ggthemes::ptol_pal()(2)[2], "black"), labels = c("high", "low")) +
+  labs(subtitle = "Zhao 2019", caption = NULL)
+
+plt.zhao.score.surv.Res <- ggsurvplot(survfit(surv.obj.zhao.uni.Resp ~ Im.status , data =df.gsva.score.Res), 
+                               conf.int = F, pval = T, risk.table = F,  
+                               title =  paste0("Immunotherapy Responders"), surv.median.line = "hv")$plot + 
+  theme_miko(legend = T, color.palette = "ptol") + 
+  # labs(subtitle = "CL + ME") + 
+  theme(legend.position = "bottom") + 
+  scale_color_manual(values = c(ggthemes::ptol_pal()(2)[2], "black"), labels = c("high", "low")) +
+  labs(subtitle = "Zhao 2019", caption = NULL)
+
+# plt.zhao.score.surv <- ggsurvplot(survfit(surv.obj.zhao.uni ~ (gsva > median(df.gsva.score2$gsva)) , data =df.gsva.score2), 
+#                                conf.int = F, pval = T, risk.table = F,  
+#                                title = paste0("Kaplan-Meier\nComposite Score"), surv.median.line = "hv")
+
+plt.zhao.score.surv.noRes
+plt.zhao.score.surv.Res
+
+plt.zhao.score.surv.noRes
+```
+```{r, fig.width=9, fig.height=5}
+
+
+plt.zhao.surv <- cowplot::plot_grid(plt.zhao.score.surv.noRes,
+plt.zhao.score.surv.Res)
+plt.zhao.surv
+
+# savePDF("Fig4G_zhao2019_survival.pdf", plt.zhao.surv,  fig.width=9, fig.height=5)
+```
+
+
+```{r}
+
+# df.gsva.score.tally <-
+#   df.gsva.score$Im.status[df.gsva.score$gsva >= 0] <- "high"
+# df.gsva.score$Im.status[df.gsva.score$gsva < 0] <- "low"
+
+# 
+  df.gsva.score$Im.status[df.gsva.score$gsva >= median(df.gsva.score$gsva)] <- "high"
+df.gsva.score$Im.status[df.gsva.score$gsva < median(df.gsva.score$gsva)] <- "low"
+  
+plt.zhao.tally <-  df.gsva.score %>%
+  dplyr::mutate(Im.status = factor(Im.status, levels = c("low", "high"))) %>%
+  dplyr::group_by(response2, Im.status) %>%
+  dplyr::tally() %>%
+  ggplot(aes(x = Im.status, y = n, fill = response2)) + 
+  geom_bar(stat = "identity", position = "fill") + 
+  labs(fill = "Group") + 
+  ggthemes::scale_fill_ptol() + theme_miko(legend = T) + labs(title = "Response by Im.status")
+
+plt.zhao.tally
+
+# savePDF("Fig4_sup4B_response_by_Im_status_010721.pdf", plt.zhao.tally)
+```
+
+
+```{r, fig.width=8,fig.height=8}
+
+
+rownames(df.zhao.patient) <- df.zhao.patient$sample_name
+df.zhao.patient2 <- df.zhao.patient
+# df.zhao.patient2 <- df.zhao.patient[ ,"response"]
+rownames(df.zhao.patient2) <- rownames(df.zhao.patient)
+
+
+col.intersect <- intersect(colnames(df.zhao.ag.ti), rownames(df.zhao.patient2))
+df.zhao.ag.ti2 <- df.zhao.ag.ti[ ,col.intersect]
+df.zhao.patient2 <- df.zhao.patient2[col.intersect, ]
+rownames(df.zhao.patient2) <- col.intersect
+
+zhao2.col <- colnames(df.zhao.ag.ti2)
+df.zhao.ag.ti2 <- apply(df.zhao.ag.ti2, 1, as.numeric)
+rownames(df.zhao.ag.ti2) <- zhao2.col
+
+rownames(df.zhao.ag.ti2) <- as.character(rownames(df.zhao.ag.ti2))
+rownames(df.zhao.patient2) <- as.character(rownames(df.zhao.patient2))
+df.zhao.patient2$responder <- as.character(df.zhao.patient2$response  == "Yes")
+df.zhao.patient2$alive <- as.character(df.zhao.patient2$alive_status == 0)
+df.zhao.patient3 <- df.zhao.patient2 %>% dplyr::select(responder, alive, patient_id, os_days_from_dx, pre_pos)
+df.zhao.patient3$patient_id <- as.character(df.zhao.patient3$patient_id)
+df.zhao.patient3$responder <- as.character(df.zhao.patient3$responder)
+
+
+
+# stage.only <- "post"
+# df.zhao.patient3 <- df.zhao.patient3 %>% dplyr::filter(pre_pos == stage.only)
+
+df.zhao.ag.ti2 <- df.zhao.ag.ti2[rownames(df.zhao.ag.ti2) %in% rownames(df.zhao.patient3), ]
+plt.gene.expr.hm <- ggplotify::as.ggplot(pheatmap::pheatmap(mat = as.matrix(df.zhao.ag.ti2), scale = "column", annotation_row = df.zhao.patient3, cluster_cols = T, cluster_rows = T, silent= T, color = colorRampPalette(rev(brewer.pal(n = 7, name ="RdBu")))(100)))
+
+plt.gene.expr.hm
+
+
+class(plt.zhao.score.surv.noRes)
+
+
+```
+
+
+```{r, fig.width=20, fig.height=10}
+
+
+plt.zhao.summary <- cowplot::plot_grid(plt.box.zhao, 
+                   cowplot::plot_grid(plt.zhao.score.surv.noRes[["plot"]], 
+                   plt.zhao.score.surv.Res[["plot"]], ncol = 1), 
+                   plt.gene.expr.hm, nrow = 1, labels = "AUTO", rel_widths = c(1,1,2))
+
+plt.zhao.summary
+
+# savePDF("Zhao2019_summary_allPatients_v2_250521.pdf", plt.zhao.summary, fig.width=20, fig.height=10)
+# savePDF("Zhao2019_summary_outliersOmitted_v2_250521.pdf", plt.zhao.summary, fig.width=20, fig.height=10)
+
+
+# savePDF("Zhao2019_summary_preOnly_v2_250521.pdf", plt.zhao.summary, fig.width=20, fig.height=10)
+
+```
+
+
+
+
+```{r Cloughesy 2019}
+
+
+# ti.ag.set <- list(
+  # ag = c("CD63", "CTSA", "PSMB9", "HLA-E", "HLA-B", "B2M", "IFI6", "LAP3", "CDKN1A", "S100A10", "NEAT1", "S100A16", "CLIC1")
+# )
+c2019.dat <- readxl::read_xlsx(path = "C:/Users/Owner/Dropbox/PDF Projects - JM/Collaborations/Maleeha/Cloughesy 2019/GSE121810_Prins.PD1NeoAdjv.Jul2018.HUGO.PtID.xlsx")
+c2019.dat <- col2rowname(c2019.dat, "Genes")
+c2019.mat <- as.matrix(c2019.dat)
+
+c2019.meta <- read.csv("C:/Users/Owner/Dropbox/PDF Projects - JM/Collaborations/Maleeha/Cloughesy 2019/Neoadj PD-1 survival_RNAseq links_01162021.csv")
+c2019.meta$patient <- stringr::str_extract(gsub("-", "", c2019.meta$SUBJECT_ID), "[0-9][0-9]")
+c2019.meta <- c2019.meta[!is.na(c2019.meta$patient), ]
+
+c2019.gsva <- GSVA::gsva(c2019.mat, gset.idx.list = ti.ag.set)
+
+df.c2019.gsva <- as.data.frame(t(c2019.gsva))
+df.c2019.gsva$subject.id <- rownames(df.c2019.gsva)
+df.c2019.gsva$patient <- stringr::str_remove(gsub("-", "", df.c2019.gsva$subject.id ), "Pt")
+df.c2019.gsva$patient <- stringr::str_remove(df.c2019.gsva$patient, "_A")
+df.c2019.gsva$patient <- stringr::str_remove(df.c2019.gsva$patient, "_B")
+df.c2019.gsva$nc <- nchar(df.c2019.gsva$patient) 
+df.c2019.gsva$patient[df.c2019.gsva$nc == 1] <- paste0("0", df.c2019.gsva$patient[df.c2019.gsva$nc == 1])
+
+
+df.c2019.merge <- merge(c2019.meta, df.c2019.gsva, by = "patient")
+
+# c2019.surv.obj <- 
+
+# df.survival.dat$PC_6_strata[df.survival.dat$PC_6 > median(df.survival.dat$PC_6)] <- "high"
+# df.survival.dat$PC_7_strata <- "low"
+# df.survival.dat$PC_7_strata[df.survival.dat$PC_7 > 0] <- "high"
+# 
+# # PC1 ########################
+# plt.csf.pc1.surv <- ggsurvplot(survfit(Surv(survival_days, alive) ~ (PC_1_strata) , data =df.survival.dat %>% dplyr::filter(type != "NPH")), 
+#                                conf.int = F, pval = T, risk.table = F,  
+#                                title = paste0("rPC_1\nKaplan-Meier"), surv.median.line = "hv")[["plot"]] + 
+#   theme_miko(color.palette = "ptol", legend = T) + theme(legend.position = "bottom")
+# plt.csf.pc1.surv
+
+kt.res <- (kruskal.test(ag  ~ (disease_status), data = df.c2019.merge))
+
+plt.c2019.box <- df.c2019.merge %>%
+  ggplot(aes(x = disease_status, y = ag)) + 
+  geom_boxplot(fill = "grey") + 
+  geom_point() + 
+  labs(subtitle = paste0("Cloughesy 2019\n",kt.res[["method"]], ", p = ", signif(kt.res[["p.value"]], 3)), title = "Im signature by therapy type", x = "Therapy", y = "Im Score") + 
+  theme_miko()
+
+df.c2019.merge %>% 
+  dplyr::group_by(disease_status) %>%
+  dplyr::tally()
+
+df.c2019.merge$im.status <- "low"
+ df.c2019.merge$im.status[df.c2019.merge$ag > median(df.c2019.merge$ag)] <- "high"
+# df.survival.dat$PC_7_strata <- "low"
+ # + disease_status
+plt.c2019.surv.na <- ggsurvplot(survfit(Surv(os_days, os_stat) ~ (im.status) , data =df.c2019.merge %>% dplyr::filter(disease_status == "neoadjuvant")),
+                               conf.int = F, pval = T, risk.table = F,
+                               title = "Neoadjuvant cohort", surv.median.line = "hv")[["plot"]] +
+  theme_miko(color.palette = "ptol", legend = T) + theme(legend.position = "bottom") + labs(subtitle = "Cloughesy 2019")
+
+plt.c2019.surv.a <- ggsurvplot(survfit(Surv(os_days, os_stat) ~ (im.status) , data =df.c2019.merge %>% dplyr::filter(disease_status == "adjuvant")),
+                               conf.int = F, pval = T, risk.table = F,
+                               title = paste0("Adjuvant cohort"), surv.median.line = "hv")[["plot"]] +
+  theme_miko(color.palette = "ptol", legend = T) + theme(legend.position = "bottom") + labs(subtitle = "Cloughesy 2019")
+
+plt.c2019.surv
+
+plt.c2019.box
+```
+
+```{r, fig.width=10, fig.height=5}
+
+plt.c2019.surv <- cowplot::plot_grid(plt.c2019.surv.a, plt.c2019.surv.na)
+
+# savePDF("Cloughesy_2019_survival_analysis_020721.pdf", plt.c2019.surv, fig.width=10, fig.height=5)
+```
+
+```{r, fig.width=5, fig.height=5}
+
+plt.c2019.box
+
+# savePDF("Cloughesy_2019_Im_score_comparison_020721.pdf", plt.c2019.box, fig.width=5, fig.height=5)
+```
+
+
+
+
+```{r analysis of primary-recurrent pairs - WANG 2021 GENOME BIOL}
+
+library(xml2)
+library(XML)
+
+raw.path <- "C:/Users/Owner/Dropbox/PDF Projects - JM/Data/scRNA-seq/01_sci-RNA-seq3_Hong_Kevin_Jason/NM_HH/PR_GBM/Papers/Wang2021_PR_GBM_bulkRNAseq_data/GSE155434_RAW/"
+
+all.file <- list.files(raw.path)
+data.list <- list()
+for (i in 1:length(all.file)){
+  miko_message(i)
+  sample.name <- gsub("_", "", stringr::str_extract(gsub("_feature_count_exon.txt.gz", "", all.file[i]), "[A-Z0-9]*_"))
+  data.list[[sample.name]] = read.table(gzfile(paste0(raw.path, all.file[i])),sep="\t", header = T)
+}
+
+
+data.matrix.long <- NULL
+e2s.all <- NULL
+for (i in 1:length(data.list)){
+  miko_message(i)
+  sample.name <- names(data.list)[i]
+  dat <- data.list[[sample.name]]
+  
+  dat$ens <- gsub("\\.", "", stringr::str_extract(dat$Geneid, "[A-Z0-9]*."))
+  dat.trim <- dat[ , grepl("ens|bam", colnames(dat))]
+  colnames(dat.trim) <- c(sample.name, "ENSEMBL")
+  
+df.nondup <- aggregate(dat.trim[ ,1], list(Gene=dat.trim$ENSEMBL), FUN = sum)
+# df.nondup <- aggregate(dat.trim[ ,1], list(Gene=dat.trim$ENSEMBL), FUN = max)
+colnames(df.nondup) <-  c( "ENSEMBL", "count")
+
+df.nondup$sample <- sample.name
+data.matrix.long <- bind_rows(data.matrix.long, df.nondup)
+
+}
+
+data.matrix <- pivot_wider(data.matrix.long, names_from = "sample", values_from = "count")
+
+e2s <- ensembl2sym(data.matrix$ENSEMBL, my.species = "Hs")
+e2s <- e2s[complete.cases(e2s), ]
+e2s.vec <- e2s$SYMBOL
+names(e2s.vec) <- e2s$ENSEMBL
+data.matrix <- data.matrix[data.matrix$ENSEMBL %in% e2s$ENSEMBL, ]
+rownames(data.matrix) <- make.unique(make.names(e2s.vec[data.matrix$ENSEMBL])) 
+class(data.matrix) <- "data.frame"
+data.matrix <- data.matrix %>% dplyr::select(-c("ENSEMBL"))
+
+
+library(GEOquery)
+eList <- getGEO("GSE155434")
+meta.data <- eList[["GSE155434_series_matrix.txt.gz"]]@phenoData@data
+
+meta.data$PR <- meta.data$`primary/recurrent:ch1`
+
+library(DESeq2)
+
+dds <- DESeqDataSetFromMatrix(countData = data.matrix, colData = meta.data, design = ~ PR)
+dds <- estimateSizeFactors(dds)
+normalized_counts <- counts(dds, normalized=TRUE)
+vsd <- vst(dds, blind = FALSE)
+normalized_counts<- assay(vsd)
+
+
+dds <- DESeq(dds)
+res <- results(dds)
+df.deg <- cbind(data.frame(gene = res@rownames),as.data.frame(res@listData))
+
+ti.ag.set.here <- list(
+  ag = c("IFI6", "S100A10", "S100A16", "LAP3", "HLA-E", "HLA-B", "CLIC1", "PSMB9", "CDKN1A", "NEAT1", "CD63", "B2M", "CTSA"),
+  # ag = c("P2RY14", "CLNK", "FLT3")
+  ti = c("LPL", "MGP", "RPL39", "RPL35", "RPL12", "RPL36", "RPL18", "RPL18A", "RPL13A", "TTYH1", "BCAN", "SCRG1")
+)
+
+
+
+
+
+normalized_counts.cur <- normalized_counts[rownames(normalized_counts) %in% unlist(ti.ag.set.here), ]
+
+miko_heatmap(normalized_counts.cur, scale = "row", annotation_col  =pr.meta %>% dplyr::select(PR), border_color = NA)
+# miko_heatmap(normalized_counts.cur, scale = "row", annotation_col  =pr.meta, border_color = NA)
+
+pr_score <- GSVA::gsva(normalized_counts, ti.ag.set.here)
+df.pr.bulk <- data.frame(t(pr_score))
+df.pr.bulk$sample <- rownames(df.pr.bulk)
+meta.data$sample <- rownames(meta.data)
+meta.data$patient <- meta.data$`patient id:ch1`
+pr.meta <- meta.data %>% dplyr::select(c("sample", "PR", "patient"))
+df.pr.bulk <- merge(df.pr.bulk, pr.meta, by = "sample")
+
+df.pr.bulk.wide <- pivot_wider(df.pr.bulk %>% dplyr::select(-c("sample", "ti")), names_from = "PR", values_from = "ag")
+
+# wilcox.test(df.pr.bulk.wide$Primary, df.pr.bulk.wide$Recurrent)
+
+wilcox.test(df.pr.bulk$ag[df.pr.bulk$PR %in% "Primary"], df.pr.bulk$ag[df.pr.bulk$PR %in% "Recurrent"])
+wilcox.test(df.pr.bulk$ti[df.pr.bulk$PR %in% "Primary"], df.pr.bulk$ti[df.pr.bulk$PR %in% "Recurrent"])
+
+
+# summary(aov(formula = ag ~ PR, data = df.pr.bulk))
+
+df.pr.bulk %>%
+  ggplot(aes(x = PR, y = ag, fill = PR)) + 
+  geom_boxplot() + 
+  geom_point() + 
+  geom_line(aes(group = patient)) + 
+  labs(title = "Progression of Immunomodulatory Signature",
+       subtitle = "Wang et al. (2021) Genome Biol",
+       y = "Im Score", x = "Disease Stage") + 
+  theme_miko(legend = F, fill.palette = "ptol")
+
+
+df.pr.bulk %>%
+  ggplot(aes(x = PR, y = ti, fill = PR)) + 
+  geom_boxplot() + 
+  geom_point() + 
+  geom_line(aes(group = patient)) + 
+  labs(title = "Progression of Translation Initiation",
+       subtitle = "Wang et al. (2021) Genome Biol",
+       y = "Im Score", x = "Disease Stage") + 
+  theme_miko(legend = F, fill.palette = "ptol")
+
+
+```
+
+
+
+```{r Wang PR DEG, fig.width=12, fig.height=5}
+
+df.deg <- cbind(data.frame(gene = res@rownames),as.data.frame(res@listData))
+
+ti.ag.set.here <- list(
+  ag = gsub("-", ".", c("IFI6", "S100A10", "S100A16", "LAP3", "HLA-E", "HLA-B", "CLIC1", "PSMB9", "CDKN1A", "NEAT1", "CD63", "B2M", "CTSA")),
+  # ag = c("P2RY14", "CLNK", "FLT3")
+  ti = c("LPL", "MGP", "RPL39", "RPL35", "RPL12", "RPL36", "RPL18", "RPL18A", "RPL13A", "TTYH1", "BCAN", "SCRG1")
+)
+
+
+sig.threshold <- 0.05
+lfc.threshold <- 0.2
+pt.size.range = c(1,4)
+label.size = 3
+cols = list(low = scales::muted("blue"), mid = "white", high = scales::muted("red"))
+color.label <- "Signature"
+  size.label <-"AvgExpr"
+y.axis.label <- "-log10(FDR)"
+plot.title <- "PR DEG"
+sig.label <- "FDR < 0.05"
+
+df.deg$feature <- df.deg$gene
+df.deg$w <- -log10(df.deg$padj) * sign(df.deg$log2FoldChange)
+df.deg$padj <- df.deg$padj + 0.001
+
+
+df.deg$type <- "other"
+df.deg$type[df.deg$gene %in% ti.ag.set.here$ag] <- "Im"
+df.deg$type[df.deg$gene %in% ti.ag.set.here$ti] <- "Ti"
+
+deg.top <- df.deg %>% dplyr::filter(gene %in% unlist(ti.ag.set.here))
+
+p1 <- ggplot() +
+  geom_point(data = df.deg %>% dplyr::filter(!(gene %in%  unlist(ti.ag.set.here))),
+             aes(x = log2FoldChange, y = -log10(padj), size = abs(baseMean)), color = "grey90") +
+  geom_point(data = df.deg %>% dplyr::mutate(type = factor(type, levels = c( "Ti", "Im"))) %>% dplyr::filter((gene %in%  unlist(ti.ag.set.here))),
+             aes(x = log2FoldChange, y = -log10(padj), color = type,  size = abs(baseMean))) +
+  scale_size(range = pt.size.range) +
+  ggrepel::geom_text_repel(data = deg.top, aes(x = log2FoldChange, y = -log10(padj), label = feature),
+                           parse = T, size = label.size, min.segment.length = 0, max.overlaps = Inf) +
+  geom_hline(yintercept = -log10(sig.threshold), linetype = "dashed") +
+  geom_vline(xintercept = 0) +
+  theme_miko(legend = T, color.palette = "ptol") +
+  labs(title =  "Differential Expression in Primary vs. Recurrent GBM",
+       subtitle = "Wang et al. (2021), n = 37 samples", caption = "DE method: DESeq2",
+       color = color.label, size = size.label, y = y.axis.label)
+
+
+deg.top.sum <- deg.top %>%
+  dplyr::group_by(type) %>%
+  dplyr::summarize(x.mean = mean(log2FoldChange),
+                   p.val = t.test(log2FoldChange)$p.value)
+
+lab1 <- paste0("mean(Im) p = ", signif(deg.top.sum$p.val[1], 3))
+lab2 <- paste0("mean(Ti) p = ", signif(deg.top.sum$p.val[2], 3))
+
+p2 <- deg.top %>%
+  dplyr::mutate(type = factor(type, levels = c( "Ti", "Im"))) %>%
+  ggplot(aes(x = log2FoldChange, y = reorder(gene, log2FoldChange), color = type)) + 
+  geom_point(aes(size = -log10(padj))) + 
+  geom_segment(aes(x = log2FoldChange -( 1.96*lfcSE), xend = log2FoldChange +( 1.96*lfcSE), 
+                   y = reorder(gene, log2FoldChange), yend = reorder(gene, log2FoldChange))) + 
+  theme_miko(color.palette = "ptol", legend = T, grid= T) + 
+  geom_vline(xintercept = 0, linetype = "dashed") + 
+  geom_vline(data = deg.top.sum, aes(xintercept = x.mean, color = type)) + 
+  labs(x = "logFC, 95% CI (Recurrent/Primary)", y = "Genes", color = "signature", size = "-log10(FDR)",
+       title = "", subtitle = paste0(lab1, "\n", lab2), 
+       caption = "vertical blue line = mean Ti logFC; vertical red line = mean Im logFC") 
+
+
+plt.deg <- cowplot::plot_grid(p1, p2, nrow = 1, align = "h", axis = "tb")
+plt.deg
+
+
+# savePDF("DEG_primary_vs_recurrent_Wang2021.pdf", plt.deg, fig.width=12, fig.height=5)
+
+```
+
+
+
+```{r phenotypic plasticity CCAT analysis, fig.width=15, fig.height=4.5}
+
+
+
+cluster.UMAP(so.query)
+
+
+
+library(SCENT)
+
+data(net17Jan16)
+
+# emat <- so.tumor@assays[["SCT"]]@data[expr_feat ,sample(colnames(so.tumor), 10000)]
+ppi_net <- net17Jan16.m
+
+my.entrez <- unique(c(colnames(ppi_net), rownames(ppi_net)))
+my.symbol <- entrez2sym(my.entrez = my.entrez, my.species = "Hs")
+e2s <- my.symbol$SYMBOL
+names(e2s) <- as.character(my.symbol$ENTREZID)
+colnames(ppi_net) <- e2s[colnames(ppi_net)]
+rownames(ppi_net) <- e2s[rownames(ppi_net)]
+
+
+ccat_res <- CompCCAT(exp.m = so.query@assays[["SCT"]]@data, ppiA.m = ppi_net)
+
+
+tiag.ms <- runMS(object = so.query, genelist = ti.ag.set.here)
+
+so.query@meta.data$ccat <- ccat_res
+so.query@meta.data$Im.score <- tiag.ms$data$ag
+so.query@meta.data$Ti.score <- tiag.ms$data$ti
+
+lab1 <- paste0("BT799 (ctrl vs. TR), p = ", signif(t.test(so.query@meta.data$ccat[so.query@meta.data$csv.barcode %in% "ctrl.0238"],
+       so.query@meta.data$ccat[so.query@meta.data$csv.barcode %in% "TR.0238"])$p.value, 3))
+lab2 <- paste0("MBT06 (ctrl vs. TR), p = ", signif(t.test(so.query@meta.data$ccat[so.query@meta.data$csv.barcode %in% "ctrl.0231"],
+       so.query@meta.data$ccat[so.query@meta.data$csv.barcode %in% "TR.0231"])$p.value, 3))
+
+p2.pp <- so.query@meta.data %>%
+  dplyr::mutate(lab = paste0(cell.line, "_", csv.barcode)) %>%
+  ggplot(aes(x = lab, y = ccat, fill = lab)) + 
+  geom_boxplot() + 
+  scale_fill_manual(values = c('BT799_ctrl.0238' = c0238.col,
+                                   'BT799_TR.0238' = t0238.col,
+                                   'MBT06_ctrl.0231' = c0231.col,
+                                   'MBT06_TR.0231' = t0231.col)) + 
+  theme_miko(grid = T, x.axis.rotation = 25) + 
+  labs(x =  NULL, y = "Phenotypic Plasticity", subtitle = paste0(lab1, "\n", lab2))
+
+
+pp.ag <- so.query@meta.data %>%
+  dplyr::mutate(lab = paste0(cell.line, "_", csv.barcode)) %>%
+  ggplot(aes(x = ccat, y = Im.score, color = lab)) + 
+  # geom_boxplot() + 
+  geom_point(size = 0.1) + 
+  scale_color_manual(values = c('BT799_ctrl.0238' = c0238.col,
+                                   'BT799_TR.0238' = t0238.col,
+                                   'MBT06_ctrl.0231' = c0231.col,
+                                   'MBT06_TR.0231' = t0231.col)) + 
+  theme_miko(grid = T, x.axis.rotation = 45, legend = T) + 
+  geom_smooth(method = "lm") + 
+  labs(y =  "Im Score", x = "Phenotypic Plasticity") + 
+  theme(legend.position = "bottom")
+
+pp.ti <- so.query@meta.data %>%
+  dplyr::mutate(lab = paste0(cell.line, "_", csv.barcode)) %>%
+  ggplot(aes(x = ccat, y = Ti.score, color = lab)) + 
+  # geom_boxplot() + 
+  geom_point(size = 0.1) + 
+  scale_color_manual(values = c('BT799_ctrl.0238' = c0238.col,
+                                   'BT799_TR.0238' = t0238.col,
+                                   'MBT06_ctrl.0231' = c0231.col,
+                                   'MBT06_TR.0231' = t0231.col)) + 
+  theme_miko(grid = T, x.axis.rotation = 45, legend = T) + 
+  geom_smooth(method = "lm") + 
+  labs(y =  "Ti Score", x = "Phenotypic Plasticity") + 
+  theme(legend.position = "none")
+
+p1.pp <- exprUMAP(so.query, "ccat",title.size = 15 , size = 1) + 
+  viridis::scale_color_viridis() + theme(legend.position = "right") + 
+  labs(title = "Phenotypic Plasticity")  + 
+  theme_miko(legend = T)  + 
+  labs(color = "CCAT") + 
+  theme_void()
+
+pp.all <- cowplot::plot_grid(p1.pp, p2.pp, cowplot::plot_grid(pp.ag, pp.ti, ncol = 1), align = "h", axis = "tb", nrow = 1)
+pp.all <- cowplot::plot_grid(p1.pp, p2.pp, pp.ag, pp.ti, align = "h", axis = "tb", nrow = 1, labels = "AUTO")
+
+pp.all
+# savePDF("phenotypic_plasticity_CCAT.pdf", pp.all, fig.width=15, fig.height=4.5)
+```
+
+
+
+```{r scRNAseq - score cancer subtypes v2, fig.width=6, fig.height=12}
+
+# get Cancer cell state genesets
+gene.list1 <- wideDF2namedList( geneSets[["CancerSEA_Hs"]])
+names(gene.list1) <- paste0("CancerSEA_", names(gene.list1))
+gene.list2 <- wideDF2namedList( geneSets[["Gavish2022_Tumor_Hallmarks"]])
+names(gene.list2) <- paste0("Gavish2022_", names(gene.list2))
+gene.list3 <- wideDF2namedList( geneSets[["GBM_Hs_Neftel2019"]])
+names(gene.list3) <- paste0("Neftel2019_", names(gene.list3))
+gene.list <- c(gene.list1, gene.list2, gene.list3)
+
+# score single cell data #######################################################
+ms.res <- runMS(object = so.query, genelist = gene.list)
+csub.mod.score <- ms.res$data[ ,names(gene.list)]
+
+# Generate heatmap stratified by sample barcode ################################
+bc <- so.query@meta.data[["Barcode"]]
+u.bc <- unique(bc)
+csub.mod.bc <- matrix(nrow = length(u.bc), ncol = length(gene.list))
+for (i in 1:length(u.bc)){
+  which.cells <- bc %in% u.bc[i]
+  csub.mod.bc[i,] <- colMeans(csub.mod.score[which.cells ,])
+}
+
+colnames(csub.mod.bc) <- names(gene.list)
+rownames(csub.mod.bc) <- u.bc
+
+# get annotations for heatmap
+df.col.ann <- data.frame(sample = rownames(csub.mod.bc))
+rownames(df.col.ann) <- rownames(csub.mod.bc)
+df.col.ann$line <- NA
+df.col.ann$line[grepl("0231", df.col.ann$sample)] <- "MBT06"
+df.col.ann$line[grepl("0238", df.col.ann$sample)] <- "BT799"
+df.col.ann <- df.col.ann %>% dplyr::select("line")
+
+
+
+aka3 = list(line = c(BT799 =  BT799.color, MBT06=MBT06.color))
+
+
+  scale.lim <- max(abs(csub.mod.bc))
+
+  my.breaks <- seq((-1*scale.lim), scale.lim, by = 0.01)
+
+hm.csub <- pheatmap::pheatmap(t(csub.mod.bc), annotation_col = df.col.ann,
+                              breaks = my.breaks,
+                              cutree_rows = 6,
+                                  color = colorRampPalette(rev(brewer.pal(n = 7, name = "RdBu")))(length(my.breaks)), #"BrBG"
+                              annotation_colors = aka3, border_color = NA)
+# BrBG
+plt.hm <- ggplotify::as.ggplot(hm.csub)
+
+
+print(plt.hm)
+
+# savePDF("signature_scores_bulk.pdf", plt.hm, fig.width=6, fig.height=12)
+# savePDF("final_cancer_state_heatmap_040321.pdf", plt.hm, fig.width = 4, fig.height = 5)
+
+```
+
+
+```{r single cell hm , fig.width=7, fig.height=9}
+
+# csub.mod.score
+
+
+df.col.ann2 <- data.frame(sample = colnames(so.query),
+                          line = so.query@meta.data$cell.line,
+                          condition = so.query@meta.data$csv.barcode)
+df.col.ann2 <- col2rowname(df.col.ann2, "sample")
+
+aka4 = list(line = c(BT799 =  BT799.color, MBT06=MBT06.color),
+            condition = c('ctrl.0238' = c0238.col,
+                                   'TR.0238' = t0238.col,
+                                   'ctrl.0231' = c0231.col,
+                                   'TR.0231' = t0231.col))
+
+plt.hm2 <- miko_heatmap(t(csub.mod.score), scale.lim = 1, 
+             annotation_col = df.col.ann2,  annotation_colors = aka4, show_colnames  = F,
+             fontsize_row = 7)
+
+plt.hm2
+
+# savePDF("signature_scores_single.pdf", plt.hm2, fig.width=7, fig.height=9)
+```
+
+```{r TCGA vs. cell line correlations, fig.width=14, fig.height = 14}
+
+gbm.mat
+
+gbm.meta.sub
+
+df.bulk
+
+
+
+df.bulk.expr <- df.bulk
+df.bulk.expr <- col2rowname(df.bulk.expr, "genes")
+colnames(df.bulk.expr) <- paste0("PDX_", colnames(df.bulk.expr))
+
+
+df.tcga.expr <- as.data.frame(gbm.mat)
+# df.bulk.expr <- col2rowname(df.bulk.expr, "genes")
+# colnames(df.tcga.expr) <- paste0("PDX_", colnames(df.bulk.expr))
+df.bulk.expr$gene <- rownames(df.bulk.expr)
+df.tcga.expr$gene <- rownames(df.tcga.expr)
+
+df.expr.merge <- merge(df.bulk.expr, df.tcga.expr, by = "gene")
+df.expr.merge <- col2rowname(df.expr.merge, "gene")
+
+
+cor.mat <- cor(df.expr.merge, method = "spearman")
+
+
+
+miko_heatmap(cor.mat,fontsize_row = 5, fontsize_col = 5)
+
+```
+
+```{r, fig.width=8, fig.height=21}
+
+
+cor.mat2 <- cor.mat[grepl("PDX", rownames(cor.mat)), grepl("TCGA", colnames(cor.mat))]
+
+hm1 <- miko_heatmap(cor.mat2, scale = "none") + labs(title = "TCGA (col) vs. PDX (row) expression similarity", subtitle ="Spearman Correlation")
+hm2 <- miko_heatmap(cor.mat2, scale = "column") + labs(title = "TCGA (col) vs. PDX (row) expression similarity", subtitle ="Spearman Correlation, column-scaled (highlights PDX model that is most similar to TCGA samples)")
+hm3 <- miko_heatmap(cor.mat2, scale = "row") + labs(title = "TCGA (col) vs. PDX (row) expression similarity", subtitle ="Spearman Correlation, row-scaled (highlights TCGA samples that are most similar to PDX models)")
+
+
+plt.sim.hm <- cowplot::plot_grid(hm1, hm2, hm3, ncol =1)
+
+
+ savePDF("TCGA_vs_PDX_similarity_profiles.pdf", plt.sim.hm, fig.width=8, fig.height=21)
+
+```
+
